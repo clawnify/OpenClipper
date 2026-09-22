@@ -478,10 +478,15 @@ function isStale(clip: Clip): boolean {
 
 // Render one clip to a vertical MP4 and keep it in this app's storage.
 //
-// Answers as soon as the work is under way and finishes it in the background:
-// a render takes minutes, and tying it to the caller's connection meant
-// closing the tab orphaned the clip in "rendering" for ever. Poll
-// GET /api/sources/:id for the outcome.
+// The work happens INSIDE this request, which is why the caller must keep it
+// open (the UI does, and reconnects by polling). Measured the hard way: doing
+// it in the background with waitUntil() looked right and silently lost the
+// job — three clips accepted at 18:24 were still "rendering" fourteen minutes
+// later, past the edit service's own 8-minute timeout, so not even the error
+// handler had run. A clip left mid-render is recovered by the staleness rule
+// below rather than by hoping the runtime keeps working after the response.
+// (Ceiling: move to the platform's /queue when a run is more clips than a
+// person wants to sit through.)
 app.post("/api/clips/:id/render", async (c) => {
   const found = await loadClip(c.req.param("id"));
   if (!found) return c.json({ error: "not_found" }, 404);
@@ -507,35 +512,32 @@ app.post("/api/clips/:id/render", async (c) => {
     title: clip.show_title ? clip.title : null,
   });
 
-  const started = await setClip(clip.id, { status: "rendering", error: null });
+  await setClip(clip.id, { status: "rendering", error: null });
   const previousOutput = clip.output_key;
-  const env = c.env;
-  const work = (async () => {
-    try {
-      const out = await renderEdit(services(env), edl, `${slug(clip.title)}.mp4`);
-      // The service's link expires; the clip should not.
-      const res = await fetch(out.url);
-      if (!res.ok || !res.body) throw new Error(`could not fetch the rendered clip (${res.status})`);
-      const size = Number(res.headers.get("content-length") ?? out.size);
-      const key = `clips/${clip.id}-${Date.now()}.mp4`;
-      const fixed = new FixedLengthStream(size);
-      const pipe = res.body.pipeTo(fixed.writable);
-      await env.UPLOADS.put(key, fixed.readable, { httpMetadata: { contentType: "video/mp4" } });
-      await pipe;
-      if (previousOutput) await env.UPLOADS.delete(previousOutput);
-      await setClip(clip.id, {
-        status: "rendered",
-        output_key: key,
-        output_size: size,
-        rendered_at: new Date().toISOString(),
-      });
-    } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
-      await setClip(clip.id, { status: "failed", error: detail.slice(0, 500) }).catch(() => {});
-    }
-  })();
-  c.executionCtx.waitUntil(work);
-  return c.json(publicClip(started), 202);
+  try {
+    const out = await renderEdit(services(c.env), edl, `${slug(clip.title)}.mp4`);
+    // The service's link expires; the clip should not.
+    const res = await fetch(out.url);
+    if (!res.ok || !res.body) throw new Error(`could not fetch the rendered clip (${res.status})`);
+    const size = Number(res.headers.get("content-length") ?? out.size);
+    const key = `clips/${clip.id}-${Date.now()}.mp4`;
+    const fixed = new FixedLengthStream(size);
+    const pipe = res.body.pipeTo(fixed.writable);
+    await c.env.UPLOADS.put(key, fixed.readable, { httpMetadata: { contentType: "video/mp4" } });
+    await pipe;
+    if (previousOutput) await c.env.UPLOADS.delete(previousOutput);
+    const done = await setClip(clip.id, {
+      status: "rendered",
+      output_key: key,
+      output_size: size,
+      rendered_at: new Date().toISOString(),
+    });
+    return c.json(publicClip(done));
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    const failed = await setClip(clip.id, { status: "failed", error: detail.slice(0, 500) });
+    return c.json(publicClip(failed), 200);
+  }
 });
 
 // The rendered MP4 — inline for the player (range-capable), or ?download=1.

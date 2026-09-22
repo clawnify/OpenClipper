@@ -33,9 +33,10 @@ function stale(clip: Clip): boolean {
 function working(clip: Clip): boolean {
   return (clip.status === "rendering" || clip.status === "analysing") && !stale(clip);
 }
-// Renders in flight at once. The render service works one clip at a time per
-// workspace; two keeps the next clip's frame reading overlapped with it.
-const RENDER_CONCURRENCY = 2;
+// Renders in flight at once. One: a workspace gets a single render container,
+// so two clips do not go twice as fast — they halve each other's CPU and both
+// creep towards the service's own render timeout.
+const RENDER_CONCURRENCY = 1;
 
 interface Detail {
   source: Source;
@@ -112,20 +113,17 @@ export function SourcePage({ id, navigate }: { id: string; navigate: (to: string
     }
   };
 
-  // The render runs on the server and outlives this page; ask for it, then
-  // watch the clip until it stops working.
+  // The render happens inside the request, which takes minutes. Don't wait on
+  // that promise to learn the outcome: poll alongside it, so a dropped
+  // connection (or a reopened page) still sees the clip finish.
   const renderOne = async (clip: Clip) => {
     replaceClip({ ...clip, status: "rendering", error: null, updated_at: new Date().toISOString() });
-    try {
-      await api.send<Clip>("POST", `/api/clips/${clip.id}/render`);
-    } catch (err) {
+    const request = api.send<Clip>("POST", `/api/clips/${clip.id}/render`).catch((err) => {
       const message = err instanceof Error ? err.message : String(err);
-      // "already rendering" is not a failure — fall through to watching it.
-      if (!/already rendering/i.test(message)) {
-        replaceClip({ ...clip, status: "failed", error: message });
-        return;
-      }
-    }
+      // "already rendering" is not a failure — the poll below reports the end.
+      return /already rendering/i.test(message) ? null : { __error: message };
+    });
+    void request;
     for (;;) {
       await new Promise((r) => setTimeout(r, POLL_MS));
       let fresh: Clip | undefined;
