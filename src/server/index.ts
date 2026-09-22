@@ -470,10 +470,12 @@ async function advanceRun(env: Bindings, source: Source, runRow: Run): Promise<R
     const rendered = await query<Clip>("SELECT * FROM clips WHERE source_id = ? AND status = 'rendered'", [source.id]);
     const windows = snapMoments(cues, found.moments, source.duration ?? 0, rendered, runRow.clip_length);
     await run("DELETE FROM clips WHERE source_id = ? AND status != 'rendered'", [source.id]);
+    // Kept (rendered) clips come first; the new proposals follow, strongest first.
+    const after = rendered.reduce((m, r) => Math.max(m, r.rank), 0);
     for (const [i, w] of windows.entries()) {
       await run(
         "INSERT INTO clips (source_id, run_id, rank, title, hook, reason, start_s, end_s, layout) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [source.id, runRow.id, i + 1, w.title.slice(0, 120), w.hook.slice(0, 400), w.reason.slice(0, 400), w.start, w.end, w.layout],
+        [source.id, runRow.id, after + i + 1, w.title.slice(0, 120), w.hook.slice(0, 400), w.reason.slice(0, 400), w.start, w.end, w.layout],
       );
     }
   }

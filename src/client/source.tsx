@@ -102,6 +102,9 @@ export function SourcePage({ id, navigate }: { id: string; navigate: (to: string
   // clip is rendering — those run on the server, so this page can be reopened
   // mid-render and still catch up.
   const status = data?.source.status;
+  // A message about the last state ("getting this video ready…") is stale
+  // once the video moves on.
+  useEffect(() => setError(null), [status]);
   const finding = starting || data?.run?.status === "finding";
   const anyWorking = !!data?.clips.some(working) || data?.run?.status === "finding";
   useEffect(() => {

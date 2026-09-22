@@ -103,7 +103,7 @@ export function findRequest(opts: {
     : "There is no transcript: the video has no speech (it may be silent, or music and sound only). Judge it by what you see and hear.";
   const prompt = `You are the best short-form video editor alive. Watch and listen to this whole video (${Math.round(opts.duration / 60)} minutes).
 
-Pick up to ${opts.maxClips} moments to publish as standalone vertical clips (YouTube Shorts, Reels, TikTok).
+Find up to ${opts.maxClips} moments to publish as standalone vertical clips (YouTube Shorts, Reels, TikTok). Aim to fill the list: a long video usually holds many — every distinct technique, sound, demo, before/after, tip or strong opinion is a candidate.
 
 Judge with your eyes and ears, not only the words. A sound demo, a preset playing, a before/after you can HEAR, or something striking on screen can be the strongest moment even with little speech.
 
@@ -112,9 +112,9 @@ What makes a moment:
 - It opens on a hook: a claim, a surprising result, a question, a before/after, a strong opinion, or a sound or picture that grabs. Start ON it — never on filler, greetings, "so", "um", or setup the hook doesn't need.
 - It ends on a completed thought or a finished payoff — not mid-explanation, not mid-sound.
 - ${band.min} to ${band.max} seconds long (${band.label}). A moment that genuinely needs a little longer to land its payoff may run a few seconds over; never pad one to reach the length.
-- Moments never overlap, and never repeat the same idea: if two moments show the same thing, keep the stronger.
+- Moments never overlap, and never repeat the same point: if two moments teach or show the same thing, keep the stronger. Two different sounds, presets or techniques are different moments, even when the video presents them the same way.
 
-Quality over count: return FEWER than ${opts.maxClips} if the video doesn't have that many strong moments. Padding the list with weak clips is the worst outcome. Order the list strongest first.
+Only stop short of ${opts.maxClips} when what's left would not work as a standalone clip — never pad the list with weak or repeated moments. Order the list strongest first.
 
 Times: when a moment starts or ends on speech, use the transcript line's time so no word is cut; otherwise the time you see or hear it.
 
