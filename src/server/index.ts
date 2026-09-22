@@ -466,13 +466,31 @@ async function analyzeClip(env: Bindings, clip: Clip, source: Source): Promise<C
   }
 }
 
+// A render that is still marked "rendering" this long after its last update
+// is not running any more: the worker that drove it is gone. Retryable.
+const RENDER_STALE_MS = 12 * 60 * 1000;
+
+function isStale(clip: Clip): boolean {
+  // SQLite datetime('now') is UTC without a zone marker.
+  const updated = Date.parse(clip.updated_at.replace(" ", "T") + "Z");
+  return !Number.isFinite(updated) || Date.now() - updated > RENDER_STALE_MS;
+}
+
 // Render one clip to a vertical MP4 and keep it in this app's storage.
+//
+// Answers as soon as the work is under way and finishes it in the background:
+// a render takes minutes, and tying it to the caller's connection meant
+// closing the tab orphaned the clip in "rendering" for ever. Poll
+// GET /api/sources/:id for the outcome.
 app.post("/api/clips/:id/render", async (c) => {
   const found = await loadClip(c.req.param("id"));
   if (!found) return c.json({ error: "not_found" }, 404);
   let { clip } = found;
   const { source } = found;
   if (clip.status === "rejected") return c.json({ error: "invalid_request", detail: "restore the clip first" }, 409);
+  if ((clip.status === "rendering" || clip.status === "analysing") && !isStale(clip)) {
+    return c.json({ error: "already_running", detail: "this clip is already rendering" }, 409);
+  }
   if (!source.transcript || !source.width || !source.height) {
     return c.json({ error: "not_ready", detail: "the video is still being prepared" }, 409);
   }
@@ -489,31 +507,35 @@ app.post("/api/clips/:id/render", async (c) => {
     title: clip.show_title ? clip.title : null,
   });
 
-  await setClip(clip.id, { status: "rendering", error: null });
-  try {
-    const out = await renderEdit(services(c.env), edl, `${slug(clip.title)}.mp4`);
-    // The service's link expires; the clip should not.
-    const res = await fetch(out.url);
-    if (!res.ok || !res.body) throw new Error(`could not fetch the rendered clip (${res.status})`);
-    const size = Number(res.headers.get("content-length") ?? out.size);
-    const key = `clips/${clip.id}-${Date.now()}.mp4`;
-    const fixed = new FixedLengthStream(size);
-    const pipe = res.body.pipeTo(fixed.writable);
-    await c.env.UPLOADS.put(key, fixed.readable, { httpMetadata: { contentType: "video/mp4" } });
-    await pipe;
-    if (clip.output_key) await c.env.UPLOADS.delete(clip.output_key);
-    const done = await setClip(clip.id, {
-      status: "rendered",
-      output_key: key,
-      output_size: size,
-      rendered_at: new Date().toISOString(),
-    });
-    return c.json(publicClip(done));
-  } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
-    await setClip(clip.id, { status: "failed", error: detail.slice(0, 500) });
-    throw err;
-  }
+  const started = await setClip(clip.id, { status: "rendering", error: null });
+  const previousOutput = clip.output_key;
+  const env = c.env;
+  const work = (async () => {
+    try {
+      const out = await renderEdit(services(env), edl, `${slug(clip.title)}.mp4`);
+      // The service's link expires; the clip should not.
+      const res = await fetch(out.url);
+      if (!res.ok || !res.body) throw new Error(`could not fetch the rendered clip (${res.status})`);
+      const size = Number(res.headers.get("content-length") ?? out.size);
+      const key = `clips/${clip.id}-${Date.now()}.mp4`;
+      const fixed = new FixedLengthStream(size);
+      const pipe = res.body.pipeTo(fixed.writable);
+      await env.UPLOADS.put(key, fixed.readable, { httpMetadata: { contentType: "video/mp4" } });
+      await pipe;
+      if (previousOutput) await env.UPLOADS.delete(previousOutput);
+      await setClip(clip.id, {
+        status: "rendered",
+        output_key: key,
+        output_size: size,
+        rendered_at: new Date().toISOString(),
+      });
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      await setClip(clip.id, { status: "failed", error: detail.slice(0, 500) }).catch(() => {});
+    }
+  })();
+  c.executionCtx.waitUntil(work);
+  return c.json(publicClip(started), 202);
 });
 
 // The rendered MP4 — inline for the player (range-capable), or ?download=1.

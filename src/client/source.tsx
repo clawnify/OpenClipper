@@ -20,6 +20,19 @@ import { btnGhost, btnIcon, btnPrimary, btnSecondary, card, Dialog, EmptyState, 
 const DEFAULT_BRIEF = "";
 const DEFAULT_COUNT = 25;
 const POLL_MS = 5000;
+// A clip still "rendering" this long after its last update is orphaned — the
+// server says the same, and offers it for retry rather than leaving it stuck.
+const RENDER_STALE_MS = 12 * 60 * 1000;
+
+function stale(clip: Clip): boolean {
+  const updated = Date.parse(clip.updated_at.replace(" ", "T") + "Z");
+  return !Number.isFinite(updated) || Date.now() - updated > RENDER_STALE_MS;
+}
+
+/** Rendering is server-side; this is how the page learns it finished. */
+function working(clip: Clip): boolean {
+  return (clip.status === "rendering" || clip.status === "analysing") && !stale(clip);
+}
 // Renders in flight at once. The render service works one clip at a time per
 // workspace; two keeps the next clip's frame reading overlapped with it.
 const RENDER_CONCURRENCY = 2;
@@ -60,13 +73,17 @@ export function SourcePage({ id, navigate }: { id: string; navigate: (to: string
     load();
   }, [load]);
 
-  // Poll while the media service is still working on the video.
+  // Poll while the media service is still working on the video, and while any
+  // clip is rendering — those run on the server, so this page can be reopened
+  // mid-render and still catch up.
   const status = data?.source.status;
+  const anyWorking = !!data?.clips.some(working);
   useEffect(() => {
-    if (!status || status === "ready" || status === "failed") return;
+    const preparing = status && status !== "ready" && status !== "failed";
+    if (!preparing && !anyWorking) return;
     const t = setInterval(load, POLL_MS);
     return () => clearInterval(t);
-  }, [status, load]);
+  }, [status, anyWorking, load]);
 
   useEffect(() => {
     if (status !== "ready") return;
@@ -95,12 +112,32 @@ export function SourcePage({ id, navigate }: { id: string; navigate: (to: string
     }
   };
 
+  // The render runs on the server and outlives this page; ask for it, then
+  // watch the clip until it stops working.
   const renderOne = async (clip: Clip) => {
-    replaceClip({ ...clip, status: "rendering", error: null });
+    replaceClip({ ...clip, status: "rendering", error: null, updated_at: new Date().toISOString() });
     try {
-      replaceClip(await api.send<Clip>("POST", `/api/clips/${clip.id}/render`));
+      await api.send<Clip>("POST", `/api/clips/${clip.id}/render`);
     } catch (err) {
-      replaceClip({ ...clip, status: "failed", error: err instanceof Error ? err.message : String(err) });
+      const message = err instanceof Error ? err.message : String(err);
+      // "already rendering" is not a failure — fall through to watching it.
+      if (!/already rendering/i.test(message)) {
+        replaceClip({ ...clip, status: "failed", error: message });
+        return;
+      }
+    }
+    for (;;) {
+      await new Promise((r) => setTimeout(r, POLL_MS));
+      let fresh: Clip | undefined;
+      try {
+        const d = await api.get<Detail>(`/api/sources/${clip.source_id}`);
+        fresh = d.clips.find((x) => x.id === clip.id);
+      } catch {
+        continue; // a blip in polling must not fail a render that is running
+      }
+      if (!fresh) return;
+      replaceClip(fresh);
+      if (!working(fresh)) return;
     }
   };
 
@@ -247,6 +284,7 @@ export function SourcePage({ id, navigate }: { id: string; navigate: (to: string
                           clip={c}
                           thumb={thumb}
                           busy={!!renderQueue}
+                          stale={stale(c)}
                           onRender={() => renderOne(c)}
                           onEdit={() => setEditing(c)}
                           onDrop={() => patch(c, { rejected: true })}
@@ -395,6 +433,7 @@ function ClipCard({
   clip,
   thumb,
   busy,
+  stale,
   onRender,
   onEdit,
   onDrop,
@@ -402,12 +441,14 @@ function ClipCard({
   clip: Clip;
   thumb: string | null;
   busy: boolean;
+  stale: boolean;
   onRender: () => void;
   onEdit: () => void;
   onDrop: () => void;
 }) {
   const len = Math.round(clip.end_s - clip.start_s);
-  const working = clip.status === "rendering" || clip.status === "analysing";
+  const working = (clip.status === "rendering" || clip.status === "analysing") && !stale;
+  const orphaned = (clip.status === "rendering" || clip.status === "analysing") && stale;
   const frame = thumb ? thumb.replace("{time}", String(Math.floor(clip.start_s + 1))) : null;
   const layouts = useMemo(() => [...new Set((clip.layout ?? []).map((s) => s.layout))], [clip.layout]);
 
@@ -456,6 +497,7 @@ function ClipCard({
           )}
         </div>
         {clip.status === "failed" && clip.error && <p className="text-fine text-danger">{clip.error}</p>}
+        {orphaned && <p className="text-fine text-muted">This render stopped before it finished. Render it again.</p>}
 
         <div className="mt-auto pt-2 flex items-center gap-1">
           {clip.status === "rendered" && clip.file_url ? (
@@ -464,7 +506,7 @@ function ClipCard({
             </a>
           ) : (
             <button className={btnSecondary} onClick={onRender} disabled={working || busy}>
-              <Film className="w-4 h-4" /> {clip.status === "failed" ? "Retry" : "Render"}
+              <Film className="w-4 h-4" /> {clip.status === "failed" || orphaned ? "Retry" : "Render"}
             </button>
           )}
           <div className="flex-1" />

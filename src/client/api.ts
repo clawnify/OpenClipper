@@ -40,6 +40,8 @@ export interface Clip {
   error: string | null;
   file_url: string | null;
   output_size: number | null;
+  /** SQLite UTC, "YYYY-MM-DD HH:MM:SS" — how a stalled render is spotted. */
+  updated_at: string;
 }
 
 export interface Run {
