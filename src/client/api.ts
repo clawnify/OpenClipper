@@ -53,6 +53,8 @@ export interface Run {
   clip_length: ClipLength;
   model: string;
   notes: string | null;
+  status: "finding" | "done" | "failed";
+  error: string | null;
   created_at: string;
 }
 

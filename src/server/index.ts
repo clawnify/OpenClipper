@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { initDB, query, get, run } from "./db";
-import { media, renderStatus, startRender, ServiceError, type MediaStatus, type ServicesConfig } from "./services";
-import { MODEL, readLayout, selectMoments, CLIP_LENGTHS, type ClipLength } from "./ai";
+import { analysis, media, renderStatus, startRender, ServiceError, type MediaStatus, type ServicesConfig } from "./services";
+import { CLIP_LENGTHS, findRequest, layoutRequest, readFind, readLayout, type ClipLength, type FoundMoment } from "./ai";
 import { captionChunks, parseVtt, snapWindow, transcriptForModel, type Cue } from "./transcript";
 import { normalizeSegments, type LayoutSegment } from "./layout";
 import { buildClipEdl } from "./edl";
@@ -22,8 +22,6 @@ type Bindings = {
   CLAWNIFY_TOKEN?: string;
   // Local dev override (defaults to https://services.clawnify.com).
   SERVICES_URL?: string;
-  // The org's OpenRouter key — moment selection and layout reading.
-  OPENROUTER_API_KEY?: string;
 };
 
 type C = { Bindings: Bindings };
@@ -40,8 +38,6 @@ function defaultMaxClips(durationSeconds: number): number {
 // Trim bounds for an edited clip, across every length choice.
 const TRIM_MIN = 6;
 const TRIM_MAX = 95;
-// Frames sampled through a clip to read its layout.
-const FRAME_STEP = 2;
 
 app.use("/api/*", async (c, next) => {
   initDB(c.env);
@@ -61,13 +57,6 @@ function services(env: Bindings): ServicesConfig {
     throw new ServiceError("not_configured", "this app has no Clawnify token — deploy it through Clawnify to use the media service", 503);
   }
   return { token: env.CLAWNIFY_TOKEN, url: env.SERVICES_URL };
-}
-
-function modelKey(env: Bindings): string {
-  if (!env.OPENROUTER_API_KEY) {
-    throw new ServiceError("not_configured", "no OpenRouter key — add one in the dashboard's API Keys settings", 503);
-  }
-  return env.OPENROUTER_API_KEY;
 }
 
 // ── Rows ─────────────────────────────────────────────────────────────
@@ -119,6 +108,10 @@ interface Run {
   clip_length: ClipLength;
   model: string;
   notes: string | null;
+  // finding → done | failed. Finding runs on the platform as a job.
+  status: "finding" | "done" | "failed";
+  job_id: string | null;
+  error: string | null;
   created_at: string;
 }
 
@@ -236,10 +229,16 @@ app.get("/api/sources/:id", async (c) => {
   }
   const [rows, runRow] = await Promise.all([
     query<Clip>("SELECT * FROM clips WHERE source_id = ? ORDER BY status = 'rejected', rank, start_s", [source.id]),
-    get<Run>("SELECT * FROM runs WHERE source_id = ? ORDER BY created_at DESC LIMIT 1", [source.id]),
+    get<Run>("SELECT * FROM runs WHERE source_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1", [source.id]),
   ]);
-  const clips = await Promise.all(rows.map((clip) => advanceRender(c.env, clip)));
-  return c.json({ source: publicSource(source), clips: clips.map(publicClip), run: runRow ?? null });
+  const runNow = runRow ? await advanceRun(c.env, source, runRow) : null;
+  // A run that just finished wrote new clips — read them again.
+  const current =
+    runRow && runNow && runRow.status !== runNow.status
+      ? await query<Clip>("SELECT * FROM clips WHERE source_id = ? ORDER BY status = 'rejected', rank, start_s", [source.id])
+      : rows;
+  const clips = await Promise.all(current.map((clip) => advanceRender(c.env, clip)));
+  return c.json({ source: publicSource(source), clips: clips.map(publicClip), run: runNow });
 });
 
 /**
@@ -319,36 +318,33 @@ async function advance(env: Bindings, source: Source): Promise<Source> {
     return setSource(source.id, { status, progress: m.progress, ...facts });
   }
 
-  const captions = m.captions?.find((x) => x.language === source.language);
-  if (!m.download || !captions) {
-    let p: MediaStatus & { no_audio?: boolean };
-    try {
-      p = await media.prepare(cfg, source.media_id, source.language);
-    } catch (err) {
-      // A 4xx is about the video itself (e.g. no audio to transcribe) and
-      // won't change on retry; a 5xx may, so it's left to the next read.
-      if (err instanceof ServiceError && err.status < 500) {
-        return setSource(source.id, { status: "failed", error: err.message, ...facts });
-      }
-      throw err;
+  // Everything the rest reads: the MP4 (cutting), captions (the transcript)
+  // and analysis readiness (finding clips). prepare is idempotent and reports
+  // all three, so until the video is ready every read just asks it.
+  let p: MediaStatus;
+  try {
+    p = await media.prepare(cfg, source.media_id, source.language);
+  } catch (err) {
+    // A 4xx is about the video itself and won't change on retry; a 5xx may,
+    // so it's left to the next read.
+    if (err instanceof ServiceError && err.status < 500) {
+      return setSource(source.id, { status: "failed", error: err.message, ...facts });
     }
-    // A silent video has nothing to transcribe. It's still usable: it becomes
-    // ready with an empty transcript ("" — known to be empty, unlike null).
-    if (p.no_audio && p.download?.status === "ready") {
-      return setSource(source.id, { status: "ready", progress: null, error: null, transcript: "", ...facts });
-    }
-    if (p.no_audio && p.download?.status === "error") {
-      return setSource(source.id, { status: "failed", error: "preparing the video failed — delete it and upload again", ...facts });
-    }
-    return setSource(source.id, { status: "preparing", progress: p.download?.percent ?? null, ...facts });
+    throw err;
   }
-  if (m.download.status === "error" || captions.status === "error") {
+  const captions = p.captions?.find((x) => x.language === source.language);
+  if (p.download?.status === "error" || captions?.status === "error") {
     return setSource(source.id, { status: "failed", error: "preparing the video failed — delete it and upload again", ...facts });
   }
-  if (m.download.status !== "ready" || captions.status !== "ready") {
-    return setSource(source.id, { status: "preparing", progress: m.download.percent ?? null, ...facts });
+  // A silent video has nothing to transcribe. It's still usable: it becomes
+  // ready with an empty transcript ("" — known to be empty, unlike null).
+  const transcribed = p.no_audio || captions?.status === "ready";
+  // A failed analysis copy is retried by the platform on a later prepare, so
+  // it stays "preparing" rather than failing the video.
+  if (p.download?.status !== "ready" || !transcribed || p.analysis !== "ready") {
+    return setSource(source.id, { status: "preparing", progress: p.download?.percent ?? null, ...facts });
   }
-  const vtt = await media.captions(cfg, source.media_id, source.language);
+  const vtt = p.no_audio ? "" : await media.captions(cfg, source.media_id, source.language);
   return setSource(source.id, { status: "ready", progress: null, error: null, transcript: vtt, ...facts });
 }
 
@@ -398,8 +394,11 @@ app.get("/api/sources/:id/playback", async (c) => {
 
 // ── Finding clips ────────────────────────────────────────────────────
 
-// One pass of the model over the whole transcript. Replaces the clips from
-// earlier passes that were never rendered; rendered clips are kept.
+// One pass over the whole video — watched, listened to, and read with its
+// transcript. Runs on the platform as a job (minutes for a long video), so this
+// answers at once; GET /api/sources/:id picks the result up (advanceRun).
+// Replaces the clips from earlier passes that were never rendered; rendered
+// clips are kept.
 app.post("/api/sources/:id/find", async (c) => {
   const b = await c.req.json<{ brief?: string; max_clips?: number; clip_length?: string }>().catch(() => ({}) as never);
   const source = await get<Source>("SELECT * FROM sources WHERE id = ?", [c.req.param("id")]);
@@ -407,67 +406,97 @@ app.post("/api/sources/:id/find", async (c) => {
   if (source.status !== "ready" || source.transcript == null || !source.duration) {
     return c.json({ error: "not_ready", detail: "the video is still being prepared" }, 409);
   }
-  if (!source.transcript) {
-    return c.json(
-      { error: "no_audio", detail: "This video has no sound, so there is no speech to find moments in." },
-      409,
-    );
-  }
-  const cues = parseVtt(source.transcript);
-  if (cues.length === 0) {
-    return c.json({ error: "no_speech", detail: "no speech was found in this video, so there's nothing to cut on" }, 422);
+  const latest = await get<Run>("SELECT * FROM runs WHERE source_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1", [source.id]);
+  if (latest?.status === "finding") {
+    return c.json({ error: "already_running", detail: "clips are already being found for this video" }, 409);
   }
   const maxClips = Math.min(MAX_CLIPS, Math.max(1, Math.round(b.max_clips ?? defaultMaxClips(source.duration))));
   const clipLength: ClipLength = b.clip_length && b.clip_length in CLIP_LENGTHS ? (b.clip_length as ClipLength) : "standard";
   const brief = (b.brief ?? "").trim().slice(0, 2000);
 
-  const pick = await selectMoments({
-    key: modelKey(c.env),
-    transcript: transcriptForModel(cues),
+  const ask = findRequest({
+    transcript: transcriptForModel(parseVtt(source.transcript)),
     duration: source.duration,
     brief,
     maxClips,
     clipLength,
   });
-
-  const rendered = await query<Clip>("SELECT * FROM clips WHERE source_id = ? AND status = 'rendered'", [source.id]);
-  const windows = snapMoments(cues, pick.moments, source.duration, rendered, clipLength);
-
-  await run("INSERT INTO runs (source_id, brief, max_clips, clip_length, model, notes) VALUES (?, ?, ?, ?, ?, ?)", [
-    source.id,
-    brief,
-    maxClips,
-    clipLength,
-    MODEL,
-    pick.notes,
-  ]);
-  const runRow = (await get<Run>("SELECT * FROM runs WHERE source_id = ? ORDER BY rowid DESC LIMIT 1", [source.id]))!;
-  await run("DELETE FROM clips WHERE source_id = ? AND status != 'rendered'", [source.id]);
-  for (const [i, w] of windows.entries()) {
-    await run(
-      "INSERT INTO clips (source_id, run_id, rank, title, hook, reason, start_s, end_s) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      [source.id, runRow.id, i + 1, w.title.slice(0, 120), w.hook.slice(0, 400), w.reason.slice(0, 400), w.start, w.end],
-    );
+  let job: { job_id: string };
+  try {
+    job = await analysis.start(services(c.env), { mediaId: source.media_id, ...ask });
+  } catch (err) {
+    // A video made ready before finding watched the whole video: get it ready
+    // for that now, and let the page follow the preparing state.
+    if (err instanceof ServiceError && err.code === "source_not_ready") {
+      await media.prepare(services(c.env), source.media_id, source.language).catch(() => null);
+      await setSource(source.id, { status: "preparing" });
+      return c.json({ error: "not_ready", detail: "Getting this video ready to find clips — this takes a few minutes." }, 409);
+    }
+    throw err;
   }
-  const clips = await query<Clip>("SELECT * FROM clips WHERE source_id = ? ORDER BY rank, start_s", [source.id]);
-  return c.json({ run: runRow, clips: clips.map(publicClip) }, 201);
+  await run(
+    "INSERT INTO runs (source_id, brief, max_clips, clip_length, model, status, job_id) VALUES (?, ?, ?, ?, ?, 'finding', ?)",
+    [source.id, brief, maxClips, clipLength, "video-analyze", job.job_id],
+  );
+  const runRow = (await get<Run>("SELECT * FROM runs WHERE source_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1", [source.id]))!;
+  return c.json({ run: runRow }, 202);
 });
 
-/** Model moments → speech-snapped, length-checked, non-overlapping windows. */
-function snapMoments(
-  cues: Cue[],
-  moments: { title: string; hook: string; reason: string; start: number; end: number }[],
-  duration: number,
-  keep: Clip[],
-  length: ClipLength,
-) {
+/**
+ * Move a finding run forward from what the platform says about its job, and
+ * when it's done, turn the moments into clips. Two overlapping reads can both
+ * see "done": only the one that claims the run (finding → done, one row
+ * changed) writes clips.
+ */
+async function advanceRun(env: Bindings, source: Source, runRow: Run): Promise<Run> {
+  if (runRow.status !== "finding" || !runRow.job_id) return runRow;
+  let job;
+  try {
+    job = await analysis.status(services(env), runRow.job_id);
+  } catch (err) {
+    if (err instanceof ServiceError && err.status === 404) return failRun(runRow, "finding clips was lost — try again");
+    return runRow; // a blip must not fail a job that is running
+  }
+  if (job.status === "failed") return failRun(runRow, job.detail ?? "finding clips failed — try again");
+  if (job.status !== "done") return runRow;
+
+  const found = readFind(job.result, runRow.max_clips);
+  const claim = await run("UPDATE runs SET status = 'done', notes = ? WHERE id = ? AND status = 'finding'", [
+    found.notes,
+    runRow.id,
+  ]);
+  if (claim.changes === 1) {
+    const cues = parseVtt(source.transcript ?? "");
+    const rendered = await query<Clip>("SELECT * FROM clips WHERE source_id = ? AND status = 'rendered'", [source.id]);
+    const windows = snapMoments(cues, found.moments, source.duration ?? 0, rendered, runRow.clip_length);
+    await run("DELETE FROM clips WHERE source_id = ? AND status != 'rendered'", [source.id]);
+    for (const [i, w] of windows.entries()) {
+      await run(
+        "INSERT INTO clips (source_id, run_id, rank, title, hook, reason, start_s, end_s, layout) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [source.id, runRow.id, i + 1, w.title.slice(0, 120), w.hook.slice(0, 400), w.reason.slice(0, 400), w.start, w.end, w.layout],
+      );
+    }
+  }
+  return (await get<Run>("SELECT * FROM runs WHERE id = ?", [runRow.id]))!;
+}
+
+async function failRun(runRow: Run, error: string): Promise<Run> {
+  await run("UPDATE runs SET status = 'failed', error = ? WHERE id = ? AND status = 'finding'", [error.slice(0, 500), runRow.id]);
+  return (await get<Run>("SELECT * FROM runs WHERE id = ?", [runRow.id]))!;
+}
+
+/**
+ * Found moments → windows that don't cut a word, length-checked,
+ * non-overlapping, each with its layout (re-based onto the snapped start).
+ */
+function snapMoments(cues: Cue[], moments: FoundMoment[], duration: number, keep: Clip[], length: ClipLength) {
   // Snapping to speech moves the ends a little; allow slack either side of
   // the requested band rather than dropping a good moment over a second.
   const band = CLIP_LENGTHS[length];
   const min = Math.max(TRIM_MIN, band.min - 5);
   const max = band.max + 8;
   const taken: { start: number; end: number }[] = keep.map((k) => ({ start: k.start_s, end: k.end_s }));
-  const out: { title: string; hook: string; reason: string; start: number; end: number }[] = [];
+  const out: { title: string; hook: string; reason: string; start: number; end: number; layout: string | null }[] = [];
   for (const m of moments) {
     const w = snapWindow(cues, { start: m.start, end: m.end }, duration);
     if (!w) continue;
@@ -475,7 +504,12 @@ function snapMoments(
     if (len < min || len > max) continue;
     if (taken.some((t) => w.start < t.end - 1 && w.end > t.start + 1)) continue;
     taken.push(w);
-    out.push({ ...m, ...w });
+    // Snapping moved the start by `shift`; the segments were timed from the
+    // model's start. No segments → null, and the render reads the layout.
+    const shift = m.start - w.start;
+    const segs = m.segments.map((sg) => ({ ...sg, from: sg.from + shift, to: sg.to + shift }));
+    const layout = segs.length ? JSON.stringify(normalizeSegments(segs, Math.round(len * 1000) / 1000)) : null;
+    out.push({ title: m.title, hook: m.hook, reason: m.reason, ...w, layout });
   }
   return out;
 }
@@ -543,61 +577,40 @@ app.post("/api/clips/:id/analyze", async (c) => {
   return c.json(publicClip(clip));
 });
 
+// Reading one clip's layout is a small job (a minute or less of video), so
+// this waits for it — bounded well inside a request's life.
+const LAYOUT_WAIT_MS = 90_000;
+const LAYOUT_POLL_MS = 3000;
+
 async function analyzeClip(env: Bindings, clip: Clip, source: Source): Promise<Clip> {
   const duration = clip.end_s - clip.start_s;
   const prev = clip.status;
   await setClip(clip.id, { status: "analysing", error: null });
   try {
-    const frames = await clipFrames(env, source, clip, duration);
-    const read = await readLayout({ key: modelKey(env), frames, duration });
-    const segments = normalizeSegments(read.segments ?? [], Math.round(duration * 1000) / 1000);
+    const cfg = services(env);
+    const job = await analysis.start(cfg, {
+      mediaId: source.media_id,
+      window: { start: clip.start_s, end: clip.end_s },
+      ...layoutRequest(),
+    });
+    const until = Date.now() + LAYOUT_WAIT_MS;
+    let result: unknown = null;
+    for (;;) {
+      await new Promise((r) => setTimeout(r, LAYOUT_POLL_MS));
+      const s = await analysis.status(cfg, job.job_id);
+      if (s.status === "done") {
+        result = s.result;
+        break;
+      }
+      if (s.status === "failed") throw new Error(s.detail ?? "reading the clip's shots failed");
+      if (Date.now() > until) throw new Error("reading the clip's shots took too long — try again");
+    }
+    const segments = normalizeSegments(readLayout(result, clip.start_s), Math.round(duration * 1000) / 1000);
     return await setClip(clip.id, { layout: JSON.stringify(segments), status: prev === "analysing" ? "proposed" : prev });
   } catch (err) {
     await setClip(clip.id, { status: prev === "analysing" ? "proposed" : prev });
     throw err;
   }
-}
-
-/**
- * The frames the model reads, as image bytes — fetched HERE and sent inline.
- *
- * The thumbnail URLs carry a signed playback token, and that token opens the
- * whole video's stream for as long as it lives, not just one frame. Handing
- * the URLs to the model provider would give a third party the client's
- * footage; sending the few kilobytes of each frame gives it nothing else.
- */
-async function clipFrames(
-  env: Bindings,
-  source: Source,
-  clip: Clip,
-  duration: number,
-): Promise<{ t: number; url: string }[]> {
-  const { thumbnail } = await media.playback(services(env), source.media_id);
-  const times: number[] = [];
-  for (let t = 0.5; t < duration; t += FRAME_STEP) {
-    // Stream thumbnails take whole seconds.
-    times.push(Math.floor(clip.start_s + t));
-  }
-  const frames = await Promise.all(
-    times.map(async (at) => {
-      const res = await fetch(thumbnail.replace("{time}", String(at)));
-      if (!res.ok) return null;
-      const type = res.headers.get("content-type")?.split(";")[0] || "image/jpeg";
-      return { t: at - clip.start_s, url: `data:${type};base64,${toBase64(new Uint8Array(await res.arrayBuffer()))}` };
-    }),
-  );
-  const got = frames.filter((f): f is { t: number; url: string } => f !== null);
-  if (got.length === 0) throw new Error("could not read any frames of this clip");
-  return got;
-}
-
-function toBase64(bytes: Uint8Array): string {
-  let binary = "";
-  // Chunked: spreading a large array into fromCharCode overflows the stack.
-  for (let i = 0; i < bytes.length; i += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  }
-  return btoa(binary);
 }
 
 // A clip "analysing" or (for a render started before renders ran on the

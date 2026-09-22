@@ -1,13 +1,15 @@
-// The two model calls, both on the org's own OpenRouter key:
+// What we ask of the platform's video analysis (/video/analyze), and how we
+// read the answers. The platform watches AND listens to the whole video, so a
+// moment can be carried by a sound or a picture, not only by what is said.
+// Which model does the watching is the platform's business; nothing here
+// depends on it.
 //
-//   selectMoments — reads the WHOLE timed transcript at once (a 2-hour video is
-//     ~40k tokens; the model's window is 1M) and picks the strongest
-//     self-contained moments. Whole-video context is the point: "strongest"
-//     and "not a repeat of another pick" can't be judged a chunk at a time.
-//   readLayout    — looks at frames sampled through one clip and says, for each
-//     stretch, whether a person fills the shot or a screen does.
-
-export const MODEL = "google/gemini-3.8-flash";
+//   findRequest   — one pass over the whole video (plus its transcript): the
+//     strongest self-contained moments, with how each stretch of each moment
+//     is shot. Whole-video context is the point: "strongest" and "not a repeat
+//     of another pick" can't be judged a chunk at a time.
+//   layoutRequest — the same layout reading for one clip on its own, for clips
+//     that predate it or were moved far by a trim.
 
 /** How long the clips should run — the one control every clipping tool has. */
 export const CLIP_LENGTHS = {
@@ -17,20 +19,49 @@ export const CLIP_LENGTHS = {
 } as const;
 export type ClipLength = keyof typeof CLIP_LENGTHS;
 
-export interface Moment {
-  title: string;
-  hook: string;
-  reason: string;
-  start: number;
-  end: number;
+export interface AnalysisRequest {
+  prompt: string;
+  schema: Record<string, unknown>;
+  thinking: "low" | "medium" | "high";
+  max_output_tokens: number;
 }
 
-export interface MomentPick {
-  moments: Moment[];
-  notes: string;
+/** "1:25:20" / "25:20" / "1:25:20.5" → seconds. NaN when unreadable. */
+export function parseClock(s: string): number {
+  const m = /^\s*(?:(\d+):)?(\d{1,2}):(\d{1,2}(?:\.\d+)?)\s*$/.exec(String(s));
+  if (!m) return NaN;
+  return (Number(m[1] ?? 0) * 3600) + Number(m[2]) * 60 + Number(m[3]);
 }
 
-const MOMENTS_SCHEMA = {
+const TIME = { type: "string", description: "position in the whole video, H:MM:SS (tenths allowed, e.g. 1:05:02.4)" };
+
+const SEGMENTS = {
+  type: "array",
+  description:
+    "how the moment is shot, stretch by stretch, covering it from start to end with no gaps; merge consecutive stretches of the same kind",
+  items: {
+    type: "object",
+    additionalProperties: false,
+    required: ["from", "to", "layout", "subject_x"],
+    properties: {
+      from: TIME,
+      to: TIME,
+      layout: {
+        type: "string",
+        enum: ["speaker", "screen"],
+        description:
+          "speaker: a person fills most of the shot (a talking head, or a wide shot of someone at a desk or instrument). screen: mainly a screen recording, software, slides or a product close-up, even with a small camera box of the person in a corner",
+      },
+      subject_x: {
+        type: "number",
+        description:
+          "speaker: where the person's FACE sits across the frame, 0.0 left edge to 1.0 right edge, two decimals (a centred face is 0.5). Only 0 or 1 if the face touches that edge. screen: 0.5",
+      },
+    },
+  },
+};
+
+const FIND_SCHEMA = {
   type: "object",
   additionalProperties: false,
   required: ["moments", "notes"],
@@ -40,13 +71,18 @@ const MOMENTS_SCHEMA = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["title", "hook", "reason", "start", "end"],
+        required: ["title", "hook", "reason", "start", "end", "segments"],
         properties: {
           title: { type: "string", description: "on-screen title, at most 8 words, no hashtags or emoji" },
-          hook: { type: "string", description: "the clip's first spoken line, verbatim from the transcript" },
-          reason: { type: "string", description: "one sentence: why a viewer keeps watching" },
-          start: { type: "number", description: "seconds — the timestamp of the cue the clip opens on" },
-          end: { type: "number", description: "seconds — the timestamp of the last cue's END (the next cue's start)" },
+          hook: {
+            type: "string",
+            description:
+              "the clip's first spoken line, verbatim; if it opens on a sound or a picture instead, describe that in [brackets]",
+          },
+          reason: { type: "string", description: "one sentence: why a viewer keeps watching — say if a sound or a picture carries it" },
+          start: TIME,
+          end: TIME,
+          segments: SEGMENTS,
         },
       },
     },
@@ -54,140 +90,104 @@ const MOMENTS_SCHEMA = {
   },
 };
 
-// Gemini 3.x thinks before it answers, and thinking tokens come out of the
-// same max_tokens budget as the answer. Set the effort per job and leave
-// headroom, or a long transcript can spend the budget thinking and return a
-// truncated (unparseable) answer. OpenRouter lists `reasoning` and
-// `structured_outputs` as supported for this model; completions cap at 65,536.
-async function callModel(
-  key: string,
-  content: unknown[],
-  schema: { name: string; schema: unknown },
-  opts: { maxTokens: number; effort: "low" | "medium" | "high" },
-): Promise<unknown> {
-  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${key}`,
-      "Content-Type": "application/json",
-      "X-Title": "OpenClipper",
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      messages: [{ role: "user", content }],
-      max_tokens: opts.maxTokens,
-      reasoning: { effort: opts.effort },
-      temperature: 0.3,
-      response_format: { type: "json_schema", json_schema: { name: schema.name, strict: true, schema: schema.schema } },
-    }),
-  });
-  if (!res.ok) throw new Error(`model call failed (${res.status}): ${(await res.text()).slice(0, 300)}`);
-  const body = (await res.json()) as { choices?: { finish_reason?: string; message?: { content?: string } }[] };
-  const choice = body.choices?.[0];
-  if (choice?.finish_reason === "length") {
-    throw new Error("the model ran out of room before finishing its answer — ask for fewer clips and try again");
-  }
-  const text = choice?.message?.content ?? "";
-  try {
-    return JSON.parse(text.replace(/^```(?:json)?\s*|\s*```$/g, ""));
-  } catch {
-    throw new Error("the model returned an unreadable answer — try again");
-  }
-}
-
-export async function selectMoments(opts: {
-  key: string;
+export function findRequest(opts: {
   transcript: string;
   duration: number;
   brief: string;
   maxClips: number;
   clipLength: ClipLength;
-}): Promise<MomentPick> {
+}): AnalysisRequest {
   const band = CLIP_LENGTHS[opts.clipLength];
-  const prompt = `You are the best short-form video editor alive. Below is the full timed transcript of a long video (${Math.round(opts.duration / 60)} minutes). Each line is "[timestamp] words" — the timestamp is when that line starts.
+  const transcript = opts.transcript.trim()
+    ? `TRANSCRIPT — machine-made from the audio, so names and jargon may be misheard; trust what you hear and see for those. Each line is "[H:MM:SS.s] words", the time that line starts.\n${opts.transcript}`
+    : "There is no transcript: the video has no speech (it may be silent, or music and sound only). Judge it by what you see and hear.";
+  const prompt = `You are the best short-form video editor alive. Watch and listen to this whole video (${Math.round(opts.duration / 60)} minutes).
 
 Pick up to ${opts.maxClips} moments to publish as standalone vertical clips (YouTube Shorts, Reels, TikTok).
 
+Judge with your eyes and ears, not only the words. A sound demo, a preset playing, a before/after you can HEAR, or something striking on screen can be the strongest moment even with little speech.
+
 What makes a moment:
 - It stands alone: a viewer who never saw the video understands it from its first second. No "as I said earlier", no dangling "this" or "that one" pointing at something outside the clip.
-- It opens on a hook: a claim, a surprising result, a question, a before/after, a strong opinion. Start ON that line — never on filler, greetings, "so", "um", or setup the hook doesn't need.
-- It ends on a completed thought — the payoff, the result, the punchline — not mid-explanation.
+- It opens on a hook: a claim, a surprising result, a question, a before/after, a strong opinion, or a sound or picture that grabs. Start ON it — never on filler, greetings, "so", "um", or setup the hook doesn't need.
+- It ends on a completed thought or a finished payoff — not mid-explanation, not mid-sound.
 - ${band.min} to ${band.max} seconds long (${band.label}). A moment that genuinely needs a little longer to land its payoff may run a few seconds over; never pad one to reach the length.
-- Moments never overlap, and never repeat the same idea: if two moments teach the same thing, keep the stronger.
+- Moments never overlap, and never repeat the same idea: if two moments show the same thing, keep the stronger.
 
 Quality over count: return FEWER than ${opts.maxClips} if the video doesn't have that many strong moments. Padding the list with weak clips is the worst outcome. Order the list strongest first.
 
-Timestamps: "start" must be the timestamp of the line the clip opens on; "end" must be the timestamp where the clip's last line ends (the start of the following line). Use seconds.
-${opts.brief ? `\nThe brief — who the clips are for and what they're for:\n${opts.brief}\n` : ""}
-TRANSCRIPT
-${opts.transcript}`;
+Times: when a moment starts or ends on speech, use the transcript line's time so no word is cut; otherwise the time you see or hear it.
 
-  const out = (await callModel(
-    opts.key,
-    [{ type: "text", text: prompt }],
-    { name: "moments", schema: MOMENTS_SCHEMA },
-    // Picking the strongest moments across hours of speech is the judgment
-    // call the whole app rests on — worth medium effort.
-    { maxTokens: 32000, effort: "medium" },
-  )) as MomentPick;
-  const moments = (out.moments ?? []).filter(
-    (m) => Number.isFinite(m.start) && Number.isFinite(m.end) && m.end > m.start && m.title,
-  );
-  return { moments: moments.slice(0, opts.maxClips), notes: out.notes ?? "" };
+For each moment also say how it is shot, stretch by stretch (segments) — it will be re-framed from 16:9 to vertical 9:16: a person is cropped around their face; a screen is shown whole.
+${opts.brief ? `\nThe brief — who the clips are for and what they're for:\n${opts.brief}\n` : ""}
+${transcript}`;
+  return { prompt, schema: FIND_SCHEMA, thinking: "medium", max_output_tokens: 32_000 };
 }
 
-export interface LayoutRead {
+export interface FoundMoment {
+  title: string;
+  hook: string;
+  reason: string;
+  start: number;
+  end: number;
+  /** Seconds relative to the moment's start, as the model saw it. */
   segments: { from: number; to: number; layout: "speaker" | "screen"; subject_x: number }[];
+}
+
+interface RawSegment {
+  from: string;
+  to: string;
+  layout: "speaker" | "screen";
+  subject_x: number;
+}
+
+/** The analysis answer → moments in seconds. Unreadable entries are dropped. */
+export function readFind(result: unknown, maxClips: number): { moments: FoundMoment[]; notes: string } {
+  const r = (result ?? {}) as {
+    moments?: { title?: string; hook?: string; reason?: string; start?: string; end?: string; segments?: RawSegment[] }[];
+    notes?: string;
+  };
+  const moments: FoundMoment[] = [];
+  for (const m of r.moments ?? []) {
+    const start = parseClock(m.start ?? "");
+    const end = parseClock(m.end ?? "");
+    if (!m.title || !(end > start)) continue;
+    moments.push({
+      title: m.title,
+      hook: m.hook ?? "",
+      reason: m.reason ?? "",
+      start,
+      end,
+      segments: relativeSegments(m.segments ?? [], start),
+    });
+  }
+  return { moments: moments.slice(0, maxClips), notes: r.notes ?? "" };
+}
+
+function relativeSegments(raw: RawSegment[], origin: number): FoundMoment["segments"] {
+  return raw
+    .map((s) => ({
+      from: parseClock(s.from) - origin,
+      to: parseClock(s.to) - origin,
+      layout: s.layout,
+      subject_x: s.subject_x,
+    }))
+    .filter((s) => Number.isFinite(s.from) && Number.isFinite(s.to));
 }
 
 const LAYOUT_SCHEMA = {
   type: "object",
   additionalProperties: false,
   required: ["segments"],
-  properties: {
-    segments: {
-      type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: ["from", "to", "layout", "subject_x"],
-        properties: {
-          from: { type: "number" },
-          to: { type: "number" },
-          layout: { type: "string", enum: ["speaker", "screen"] },
-          subject_x: {
-            type: "number",
-            description:
-              "speaker: where the person's face sits across the frame, as a fraction of its width — 0.0 is the left edge, 0.5 the middle, 1.0 the right edge. Estimate to two decimals (e.g. 0.42). Only answer 0 or 1 if the face is literally against that edge. screen: 0.5",
-          },
-        },
-      },
-    },
-  },
+  properties: { segments: SEGMENTS },
 };
 
-/**
- * Frames are sampled every few seconds through the clip; `frames[i].t` is
- * seconds from the clip start. The answer is a list of stretches — cut
- * points land between frames.
- */
-export async function readLayout(opts: {
-  key: string;
-  frames: { t: number; url: string }[];
-  duration: number;
-}): Promise<LayoutRead> {
-  const intro = `These are frames from a ${opts.duration.toFixed(1)}-second clip of a 16:9 video that will be re-framed to vertical 9:16. Each frame is labelled with its time in seconds from the clip start.
+export function layoutRequest(): AnalysisRequest {
+  const prompt = `This stretch of a 16:9 video will be re-framed to vertical 9:16. Split it into stretches by how it is shot, covering it from start to end with no gaps, and label each: "speaker" (a person fills most of the shot — we crop a narrow window around their face) or "screen" (mainly a screen recording, software, slides or a product close-up, even with a small camera box in a corner — we show the whole frame so nothing on screen is lost). When the shot changes, put the boundary where it changes.`;
+  return { prompt, schema: LAYOUT_SCHEMA, thinking: "low", max_output_tokens: 6000 };
+}
 
-Split the clip into stretches and label each:
-- "speaker": a person fills most of the shot (a talking head, or a wide shot of someone at a desk or instrument). We will crop a narrow vertical window around them, so give subject_x: the horizontal position of their FACE as a fraction of the frame width, two decimals. A face in the middle is 0.5; halfway between the middle and the right edge is 0.75. 0 and 1 mean the face is touching the very edge, which is rare — do not use them as a default.
-- "screen": the shot is mainly a screen recording, software, slides or a product close-up — even if a small camera box of the person sits in a corner. We will show the whole frame so nothing on screen is lost. subject_x = 0.5.
-
-Stretches must cover 0 to ${opts.duration.toFixed(1)} with no gaps. When the shot changes between two frames, put the boundary halfway between them. Merge consecutive frames with the same layout into one stretch.`;
-
-  const content: unknown[] = [{ type: "text", text: intro }];
-  for (const f of opts.frames) {
-    content.push({ type: "text", text: `t=${f.t.toFixed(1)}s` });
-    content.push({ type: "image_url", image_url: { url: f.url } });
-  }
-  return (await callModel(opts.key, content, { name: "layout", schema: LAYOUT_SCHEMA }, { maxTokens: 6000, effort: "low" })) as LayoutRead;
+/** The layout answer → segments relative to `clipStart`. */
+export function readLayout(result: unknown, clipStart: number): FoundMoment["segments"] {
+  return relativeSegments(((result ?? {}) as { segments?: RawSegment[] }).segments ?? [], clipStart);
 }

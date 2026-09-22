@@ -60,7 +60,7 @@ interface Detail {
 const PREP_COPY: Record<string, string> = {
   uploading: "Waiting for the upload to finish.",
   processing: "The video is being processed. Long videos take a few minutes.",
-  preparing: "Transcribing the video and preparing it for cutting.",
+  preparing: "Transcribing the video and getting it ready to be watched. A long video takes 10–25 minutes.",
 };
 
 export function SourcePage({ id, navigate }: { id: string; navigate: (to: string) => void }) {
@@ -68,7 +68,8 @@ export function SourcePage({ id, navigate }: { id: string; navigate: (to: string
   const [missing, setMissing] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [thumb, setThumb] = useState<string | null>(null);
-  const [finding, setFinding] = useState(false);
+  // Sending the find request; after that the run's own status says it's on.
+  const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [editing, setEditing] = useState<Clip | null>(null);
@@ -101,7 +102,8 @@ export function SourcePage({ id, navigate }: { id: string; navigate: (to: string
   // clip is rendering — those run on the server, so this page can be reopened
   // mid-render and still catch up.
   const status = data?.source.status;
-  const anyWorking = !!data?.clips.some(working);
+  const finding = starting || data?.run?.status === "finding";
+  const anyWorking = !!data?.clips.some(working) || data?.run?.status === "finding";
   useEffect(() => {
     const preparing = status && status !== "ready" && status !== "failed";
     if (!preparing && !anyWorking) return;
@@ -120,20 +122,24 @@ export function SourcePage({ id, navigate }: { id: string; navigate: (to: string
   const replaceClip = (c: Clip) =>
     setData((d) => (d ? { ...d, clips: d.clips.map((x) => (x.id === c.id ? c : x)) } : d));
 
+  // Finding runs on the platform (minutes for a long video): the request only
+  // starts it, and the poll above follows the run until its clips arrive.
   const find = async (brief: string, maxClips: number, clipLength: ClipLength) => {
-    setFinding(true);
+    setStarting(true);
     setError(null);
     try {
-      const out = await api.send<{ run: Run; clips: Clip[] }>("POST", `/api/sources/${id}/find`, {
+      const out = await api.send<{ run: Run }>("POST", `/api/sources/${id}/find`, {
         brief,
         max_clips: maxClips,
         clip_length: clipLength,
       });
-      setData((d) => (d ? { ...d, run: out.run, clips: out.clips } : d));
+      setData((d) => (d ? { ...d, run: out.run } : d));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      // e.g. the video went back to preparing — show that.
+      load();
     } finally {
-      setFinding(false);
+      setStarting(false);
     }
   };
 
@@ -278,20 +284,29 @@ export function SourcePage({ id, navigate }: { id: string; navigate: (to: string
               onFind={find}
             />
             {error && <p className="mt-3 text-body-sm text-danger">{error}</p>}
+            {!error && run?.status === "failed" && run.error && (
+              <p className="mt-3 text-body-sm text-danger">{run.error}</p>
+            )}
 
             {finding ? (
-              <div className="mt-6 grid grid-cols-1 lg:grid-cols-2 gap-4">
-                {[0, 1, 2, 3].map((i) => (
-                  <div key={i} className="flex gap-3 rounded-md bg-surface-sunken/60 p-0 overflow-hidden">
-                    <div className="w-36 sm:w-40 aspect-[9/16] bg-surface-sunken animate-pulse" />
-                    <div className="flex-1 p-3 space-y-2">
-                      <div className="h-2.5 w-1/3 rounded-full bg-surface-sunken animate-pulse" />
-                      <div className="h-3.5 w-3/4 rounded-full bg-surface-sunken animate-pulse" />
-                      <div className="h-3 w-2/3 rounded-full bg-surface-sunken animate-pulse" />
+              <>
+                <p className="mt-6 text-body-sm text-muted max-w-2xl">
+                  Watching and listening to the whole video. A long video takes a few minutes — you can leave this page
+                  and come back.
+                </p>
+                <div className="mt-3 grid grid-cols-1 lg:grid-cols-2 gap-4">
+                  {[0, 1, 2, 3].map((i) => (
+                    <div key={i} className="flex gap-3 rounded-md bg-surface-sunken/60 p-0 overflow-hidden">
+                      <div className="w-36 sm:w-40 aspect-[9/16] bg-surface-sunken animate-pulse" />
+                      <div className="flex-1 p-3 space-y-2">
+                        <div className="h-2.5 w-1/3 rounded-full bg-surface-sunken animate-pulse" />
+                        <div className="h-3.5 w-3/4 rounded-full bg-surface-sunken animate-pulse" />
+                        <div className="h-3 w-2/3 rounded-full bg-surface-sunken animate-pulse" />
+                      </div>
                     </div>
-                  </div>
-                ))}
-              </div>
+                  ))}
+                </div>
+              </>
             ) : (
               <>
                 {run?.notes && live.length > 0 && (
@@ -464,7 +479,7 @@ function FindPanel({
         {/* The page's one primary action while no clips exist. */}
         <button className={hasClips ? btnSecondary : btnPrimary} onClick={() => onFind(brief, count, length)} disabled={busy}>
           {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
-          {busy ? "Reading the transcript…" : hasClips ? "Replace unrendered clips" : "Find clips"}
+          {busy ? "Watching the video…" : hasClips ? "Replace unrendered clips" : "Find clips"}
         </button>
       </div>
       {hasClips && <p className="mt-2 text-fine text-muted">Rendered clips are kept; the rest are replaced.</p>}

@@ -38,12 +38,14 @@ export function parseVtt(vtt: string): Cue[] {
 }
 
 /** "[1:02:03.4] text" — how the model reads the transcript (and cites times). */
+/** Always H:MM:SS.s — the one time format the transcript and the answers share. */
 export function stamp(seconds: number): string {
-  const s = Math.max(0, seconds);
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = (s % 60).toFixed(1).padStart(4, "0");
-  return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
+  // Round to tenths first, so 59.96 reads 0:01:00.0, not 0:00:60.0.
+  const t = Math.round(Math.max(0, seconds) * 10) / 10;
+  const h = Math.floor(t / 3600);
+  const m = Math.floor((t % 3600) / 60);
+  const sec = (t % 60).toFixed(1).padStart(4, "0");
+  return `${h}:${String(m).padStart(2, "0")}:${sec}`;
 }
 
 export function transcriptForModel(cues: Cue[]): string {
@@ -60,30 +62,33 @@ const LEAD_IN = 0.12;
 const TAIL_OUT = 0.35;
 
 /**
- * Snap a proposed window to speech boundaries: start where the first spoken
- * cue at/after `start` begins, end where the cue covering `end` finishes — so
- * a clip never opens or closes mid-word. Returns null when the window holds
- * no speech.
+ * Keep a proposed window from opening or closing mid-word. A cut point that
+ * lands inside a spoken cue moves out to that cue's edge; one that lands in
+ * silence stays where it is. The window is never shrunk to the speech inside
+ * it: a moment can be a sound demo with a single line of talk, and that sound
+ * is the clip. A little breathing room is added, but never into a
+ * neighbouring cue's words. Null only for an empty window.
  */
 export function snapWindow(cues: Cue[], w: Window, duration: number): Window | null {
-  // First cue whose speech reaches past the proposed start (tolerate the
-  // model citing a time a hair inside the cue).
-  const first = cues.findIndex((c) => c.end > w.start + 0.05);
-  if (first < 0) return null;
-  // Last cue that starts before the proposed end.
-  let last = -1;
-  for (let i = cues.length - 1; i >= first; i--) {
-    if (cues[i].start < w.end - 0.05) {
-      last = i;
-      break;
-    }
-  }
-  if (last < first) return null;
+  let start = Math.max(0, w.start);
+  let end = Math.min(duration, w.end);
+  if (!(end > start)) return null;
 
-  const prevEnd = first > 0 ? cues[first - 1].end : 0;
-  const nextStart = last + 1 < cues.length ? cues[last + 1].start : duration;
-  const start = Math.max(prevEnd, cues[first].start - LEAD_IN, 0);
-  const end = Math.min(nextStart, cues[last].end + TAIL_OUT, duration);
+  // Tolerate the model citing a time a hair inside a cue's edge.
+  const atStart = cues.find((c) => c.start < start - 0.05 && c.end > start + 0.05);
+  if (atStart) start = atStart.start;
+  const atEnd = cues.find((c) => c.start < end - 0.05 && c.end > end + 0.05);
+  if (atEnd) end = atEnd.end;
+
+  // Breathing room, kept inside the silence around the window.
+  let prevEnd = 0;
+  let nextStart = duration;
+  for (const c of cues) {
+    if (c.end <= start + 0.05) prevEnd = Math.max(prevEnd, c.end);
+    if (c.start >= end - 0.05) nextStart = Math.min(nextStart, c.start);
+  }
+  start = Math.max(prevEnd, start - LEAD_IN, 0);
+  end = Math.min(nextStart, end + TAIL_OUT, duration);
   return { start: round(start), end: round(end) };
 }
 

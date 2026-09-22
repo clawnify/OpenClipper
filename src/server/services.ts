@@ -4,6 +4,8 @@
 //                 their transcript, frames and playback
 //   /video/edit — renders one clip's edit document to MP4, reading only the
 //                 clip's seconds out of the source
+//   /video/analyze — watches and listens to a video (or a stretch of it) and
+//                 answers a prompt, as JSON when given a schema
 
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
 
@@ -59,6 +61,10 @@ export interface MediaStatus {
   height: number | null;
   download?: { status: string; percent: number } | null;
   captions?: { language: string; status: string }[];
+  /** Whether /video/analyze can read this video yet. */
+  analysis?: "none" | "preparing" | "ready" | "failed";
+  /** Set by prepare for a video with no audio track: it gets no captions. */
+  no_audio?: boolean;
 }
 
 export const media = {
@@ -101,3 +107,39 @@ export interface RenderStatus {
 export function renderStatus(cfg: ServicesConfig, jobId: string) {
   return call<RenderStatus>(cfg, `/video/edit/${jobId}`);
 }
+
+export interface AnalysisStatus {
+  status: "queued" | "running" | "done" | "failed";
+  result?: unknown;
+  detail?: string;
+}
+
+/**
+ * Ask the platform about a video — the whole of it, or `window` seconds of it.
+ * Answers come back as a job: watching a long video takes minutes.
+ */
+export const analysis = {
+  start: (
+    cfg: ServicesConfig,
+    body: {
+      mediaId: string;
+      prompt: string;
+      schema: Record<string, unknown>;
+      thinking: "low" | "medium" | "high";
+      max_output_tokens: number;
+      window?: { start: number; end: number };
+    },
+  ) =>
+    call<{ job_id: string; status: string }>(cfg, "/video/analyze", {
+      method: "POST",
+      body: JSON.stringify({
+        source: `media:${body.mediaId}`,
+        prompt: body.prompt,
+        schema: body.schema,
+        thinking: body.thinking,
+        max_output_tokens: body.max_output_tokens,
+        window: body.window,
+      }),
+    }),
+  status: (cfg: ServicesConfig, jobId: string) => call<AnalysisStatus>(cfg, `/video/analyze/${jobId}`),
+};

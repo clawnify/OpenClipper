@@ -10,9 +10,6 @@
     "database": true,
     "storage": true
   },
-  "env": {
-    "required": ["OPENROUTER_API_KEY"]
-  },
   "deploy": {
     "title": "Deploy your OpenClipper",
     "subtitle": "Long videos in, captioned vertical clips out.",

@@ -48,6 +48,10 @@ CREATE TABLE IF NOT EXISTS runs (
   model TEXT NOT NULL,
   -- The model's own note on what it found (and why there may be fewer clips).
   notes TEXT,
+  -- Finding runs on the platform as a job: finding → done | failed.
+  status TEXT NOT NULL DEFAULT 'done',
+  job_id TEXT,
+  error TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
