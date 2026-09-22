@@ -5,6 +5,14 @@ import { MODEL, readLayout, selectMoments } from "./ai";
 import { captionChunks, parseVtt, snapWindow, transcriptForModel, type Cue } from "./transcript";
 import { normalizeSegments, type LayoutSegment } from "./layout";
 import { buildClipEdl } from "./edl";
+import {
+  directDownloadUrl,
+  folderListingUrl,
+  isVideoName,
+  judgeLinkResponse,
+  parseDriveLink,
+  parseFolderListing,
+} from "./drive-link";
 
 type Bindings = {
   DB: D1Database;
@@ -143,12 +151,58 @@ app.post("/api/sources/upload", async (c) => {
   return c.json({ source: publicSource(row), upload_url: up.upload_url }, 201);
 });
 
+// List a public Google Drive folder, so a link a client shared is a list to
+// pick from rather than something to copy file ids out of. Unauthenticated on
+// purpose: the folder is public, and asking the org to connect Drive to read a
+// link anyone can open would be friction for nothing.
+app.get("/api/drive/folder", async (c) => {
+  const link = parseDriveLink(c.req.query("url") ?? "");
+  if (link?.kind !== "folder") {
+    return c.json({ error: "invalid_request", detail: "that isn't a Google Drive folder link" }, 400);
+  }
+  const res = await fetch(folderListingUrl(link.id), { headers: { "User-Agent": "OpenClipper" } });
+  if (!res.ok) {
+    return c.json({ error: "folder_unreadable", detail: "couldn't open that folder — is it shared with anyone who has the link?" }, 422);
+  }
+  const files = parseFolderListing(await res.text());
+  if (files.length === 0) {
+    return c.json({ error: "folder_unreadable", detail: "that folder is empty, or it isn't shared with anyone who has the link" }, 422);
+  }
+  return c.json({ files: files.map((f) => ({ ...f, video: isVideoName(f.name) })) });
+});
+
 // Import from a link: the media service pulls the file itself (any size).
+// A Google Drive link is resolved to the URL that serves the file's own bytes,
+// and checked before it goes any further — Drive answers a file that is over
+// its download quota, or not public, with an HTML page and a 200, which would
+// otherwise import as a few KB of "video".
 app.post("/api/sources/import", async (c) => {
   const b = await c.req.json<{ url?: string; name?: string; language?: string }>().catch(() => ({}) as never);
   if (!b.url) return c.json({ error: "invalid_request", detail: "a link to the video file is required" }, 400);
-  const name = b.name?.trim() || decodeURIComponent(new URL(b.url).pathname.split("/").pop() || "") || "Imported video";
-  const m = await media.import(services(c.env), b.url, name);
+  const link = parseDriveLink(b.url);
+  if (link?.kind === "folder") {
+    return c.json({ error: "invalid_request", detail: "that's a folder — open it to pick a video" }, 400);
+  }
+  const url = link ? directDownloadUrl(link.id) : b.url;
+
+  const probe = await fetch(url, { headers: { Range: "bytes=0-1" }, redirect: "follow" }).catch(() => null);
+  if (!probe) return c.json({ error: "invalid_request", detail: "that link could not be reached" }, 422);
+  const verdict = judgeLinkResponse(
+    probe.status,
+    probe.headers.get("content-type"),
+    probe.headers.get("content-range"),
+    probe.headers.get("content-length"),
+  );
+  await probe.body?.cancel();
+  if (!verdict.ok) return c.json({ error: "invalid_request", detail: verdict.reason ?? "that link isn't a video" }, 422);
+
+  const fromHeader = probe.headers.get("content-disposition")?.match(/filename\*?=(?:UTF-8'')?"?([^";]+)/i)?.[1];
+  const name =
+    b.name?.trim() ||
+    (fromHeader ? decodeURIComponent(fromHeader).replace(/\.[^.]+$/, "") : "") ||
+    decodeURIComponent(new URL(url).pathname.split("/").pop() || "") ||
+    "Imported video";
+  const m = await media.import(services(c.env), url, name);
   const row = await insertSource(name, m.id, b.language, "processing");
   return c.json({ source: publicSource(row) }, 201);
 });

@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { Upload as UploadIcon, Link2, Loader2, Plus, Scissors, Trash2, Film } from "lucide-react";
+import { Upload as UploadIcon, Link2, Loader2, Plus, Scissors, Trash2, Film, FolderOpen, Check } from "lucide-react";
 import * as tus from "tus-js-client";
 import { api, bytes, clock, LANGUAGES, type Source } from "./api";
-import { btnGhost, btnIcon, btnPrimary, ConfirmDialog, Dialog, EmptyState, Kbd } from "./ui";
+import { btnGhost, btnIcon, btnPrimary, btnSecondary, ConfirmDialog, Dialog, EmptyState, Kbd } from "./ui";
 
 const STATUS: Record<Source["status"], { label: string; tone: string }> = {
   uploading: { label: "Uploading", tone: "bg-info-tint text-info border-info/30" },
@@ -148,8 +148,13 @@ function AddVideoDialog({ onClose, onAdded }: { onClose: () => void; onAdded: (s
   const [language, setLanguage] = useState("en");
   const [progress, setProgress] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // A shared Drive FOLDER link: listed so a video can be picked from it.
+  const [folder, setFolder] = useState<{ id: string; name: string; video: boolean }[] | null>(null);
+  const [picked, setPicked] = useState<{ id: string; name: string } | null>(null);
+  const [listing, setListing] = useState(false);
   const upload = useRef<tus.Upload | null>(null);
   const busy = progress !== null;
+  const isFolderLink = /drive\.google\.com\/.*\/folders\//.test(url);
 
   useEffect(
     () => () => {
@@ -158,12 +163,35 @@ function AddVideoDialog({ onClose, onAdded }: { onClose: () => void; onAdded: (s
     [],
   );
 
+  // Paste a folder link → list what's in it. The folder is public, so this
+  // needs nothing connected.
+  const openFolder = async () => {
+    setListing(true);
+    setError(null);
+    setFolder(null);
+    setPicked(null);
+    try {
+      const out = await api.get<{ files: { id: string; name: string; video: boolean }[] }>(
+        `/api/drive/folder?url=${encodeURIComponent(url.trim())}`,
+      );
+      setFolder(out.files);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setListing(false);
+    }
+  };
+
   const start = async () => {
     setError(null);
     try {
       if (mode === "link") {
         setProgress(0);
-        const { source } = await api.send<{ source: Source }>("POST", "/api/sources/import", { url, name, language });
+        const { source } = await api.send<{ source: Source }>("POST", "/api/sources/import", {
+          url: picked ? `https://drive.google.com/file/d/${picked.id}/view` : url,
+          name: name.trim() || (picked ? picked.name.replace(/\.[^.]+$/, "") : ""),
+          language,
+        });
         onAdded(source);
         return;
       }
@@ -194,7 +222,8 @@ function AddVideoDialog({ onClose, onAdded }: { onClose: () => void; onAdded: (s
     }
   };
 
-  const canStart = mode === "file" ? !!file : /^https:\/\/\S+$/.test(url.trim());
+  const canStart =
+    mode === "file" ? !!file : isFolderLink ? !!picked : /^https:\/\/\S+$/.test(url.trim());
 
   return (
     <Dialog
@@ -209,7 +238,13 @@ function AddVideoDialog({ onClose, onAdded }: { onClose: () => void; onAdded: (s
           </button>
           <button className={btnPrimary} onClick={start} disabled={!canStart || busy} data-autofocus>
             {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : mode === "file" ? <UploadIcon className="w-4 h-4" /> : <Link2 className="w-4 h-4" />}
-            {busy && mode === "file" ? `Uploading ${Math.round((progress ?? 0) * 100)}%` : mode === "file" ? "Upload" : "Import"}
+            {busy && mode === "file"
+              ? `Uploading ${Math.round((progress ?? 0) * 100)}%`
+              : mode === "file"
+                ? "Upload"
+                : picked
+                  ? "Import selected"
+                  : "Import"}
           </button>
         </>
       }
@@ -254,7 +289,37 @@ function AddVideoDialog({ onClose, onAdded }: { onClose: () => void; onAdded: (s
               placeholder="https://…/episode-12.mp4"
               className="mt-1 block w-full h-9 px-2.5 rounded-sm bg-surface shadow-edge text-body-sm"
             />
-            <span className="mt-1 block text-fine text-muted">A link that downloads the file itself, not a page that plays it.</span>
+            <span className="mt-1 block text-fine text-muted">
+              A Google Drive link works — a file, or a folder shared with anyone who has the link.
+            </span>
+            {isFolderLink && !folder && (
+              <button className={`${btnSecondary} mt-2`} onClick={openFolder} disabled={listing || busy} type="button">
+                {listing ? <Loader2 className="w-4 h-4 animate-spin" /> : <FolderOpen className="w-4 h-4" />} Open folder
+              </button>
+            )}
+            {folder && (
+              <div className="mt-2">
+                <div className="text-micro uppercase text-muted mb-1">Pick a video</div>
+                <ul className="max-h-52 overflow-y-auto rounded-sm shadow-edge divide-y divide-border">
+                  {folder.filter((f) => f.video).map((f) => (
+                    <li key={f.id}>
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => setPicked({ id: f.id, name: f.name })}
+                        className={`flex w-full items-center gap-2 px-2.5 py-2 text-left text-body-sm ${picked?.id === f.id ? "bg-surface-sunken" : "hover:bg-surface-sunken"}`}
+                      >
+                        {picked?.id === f.id ? <Check className="w-4 h-4 shrink-0" /> : <Film className="w-4 h-4 shrink-0 text-faint" />}
+                        <span className="truncate">{f.name}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+                {folder.filter((f) => f.video).length === 0 && (
+                  <p className="mt-1 text-fine text-muted">No videos in that folder.</p>
+                )}
+              </div>
+            )}
           </label>
         )}
 
