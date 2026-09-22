@@ -21,6 +21,11 @@ export interface LayoutSegment {
 
 // Shorter than this and a switch reads as a glitch, not a cut.
 const MIN_SEGMENT = 2;
+// A face centre reported hard against an edge is the model saturating, not a
+// person standing at the frame's border: every real shot has the face inboard
+// of this. Treated as "don't know" — centre the crop instead of cropping the
+// wrong third of the frame.
+const EDGE = 0.02;
 
 /**
  * Turn whatever the model returned into a clean cover of [0, duration]:
@@ -35,7 +40,7 @@ export function normalizeSegments(raw: LayoutSegment[], duration: number): Layou
       ...s,
       from: clamp(s.from, 0, duration),
       to: clamp(s.to, 0, duration),
-      subject_x: s.layout === "speaker" ? clamp(s.subject_x ?? 0.5, 0, 1) : undefined,
+      subject_x: s.layout === "speaker" ? faceCentre(s.subject_x) : undefined,
     }))
     .filter((s) => s.to - s.from > 0.01)
     .sort((a, b) => a.from - b.from);
@@ -82,6 +87,12 @@ export function normalizeSegments(raw: LayoutSegment[], duration: number): Layou
     layout: s.layout,
     ...(s.layout === "speaker" ? { subject_x: round(s.subject_x ?? 0.5) } : {}),
   }));
+}
+
+function faceCentre(x: number | undefined): number {
+  if (x === undefined || !Number.isFinite(x)) return 0.5;
+  if (x <= EDGE || x >= 1 - EDGE) return 0.5;
+  return clamp(x, 0, 1);
 }
 
 function clamp(n: number, lo: number, hi: number): number {

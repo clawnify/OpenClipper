@@ -145,7 +145,11 @@ const LAYOUT_SCHEMA = {
           from: { type: "number" },
           to: { type: "number" },
           layout: { type: "string", enum: ["speaker", "screen"] },
-          subject_x: { type: "number", description: "speaker: horizontal centre of the person's face, 0 = left edge, 1 = right edge. screen: 0.5" },
+          subject_x: {
+            type: "number",
+            description:
+              "speaker: where the person's face sits across the frame, as a fraction of its width — 0.0 is the left edge, 0.5 the middle, 1.0 the right edge. Estimate to two decimals (e.g. 0.42). Only answer 0 or 1 if the face is literally against that edge. screen: 0.5",
+          },
         },
       },
     },
@@ -165,7 +169,7 @@ export async function readLayout(opts: {
   const intro = `These are frames from a ${opts.duration.toFixed(1)}-second clip of a 16:9 video that will be re-framed to vertical 9:16. Each frame is labelled with its time in seconds from the clip start.
 
 Split the clip into stretches and label each:
-- "speaker": a person fills most of the shot (a talking head, or a wide shot of someone at a desk or instrument). We will crop a narrow vertical window around them — give subject_x, the horizontal centre of their face.
+- "speaker": a person fills most of the shot (a talking head, or a wide shot of someone at a desk or instrument). We will crop a narrow vertical window around them, so give subject_x: the horizontal position of their FACE as a fraction of the frame width, two decimals. A face in the middle is 0.5; halfway between the middle and the right edge is 0.75. 0 and 1 mean the face is touching the very edge, which is rare — do not use them as a default.
 - "screen": the shot is mainly a screen recording, software, slides or a product close-up — even if a small camera box of the person sits in a corner. We will show the whole frame so nothing on screen is lost. subject_x = 0.5.
 
 Stretches must cover 0 to ${opts.duration.toFixed(1)} with no gaps. When the shot changes between two frames, put the boundary halfway between them. Merge consecutive frames with the same layout into one stretch.`;

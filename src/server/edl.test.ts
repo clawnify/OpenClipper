@@ -110,3 +110,18 @@ describe("buildClipEdl", () => {
     expect(() => buildClipEdl({ ...base, captions, segments: [{ from: 0, to: 45, layout: "screen" }] })).toThrow(/too dense/);
   });
 });
+
+describe("normalizeSegments — face position", () => {
+  it("treats a face reported at the very edge as unknown and centres it", () => {
+    // Observed live: the model answered subject_x = 1 for a centred talking
+    // head, which would have cropped the right-hand third of the frame.
+    expect(normalizeSegments([{ from: 0, to: 30, layout: "speaker", subject_x: 1 }], 30)).toEqual([
+      { from: 0, to: 30, layout: "speaker", subject_x: 0.5 },
+    ]);
+    expect(normalizeSegments([{ from: 0, to: 30, layout: "speaker", subject_x: 0 }], 30)[0].subject_x).toBe(0.5);
+  });
+
+  it("keeps a real off-centre face", () => {
+    expect(normalizeSegments([{ from: 0, to: 30, layout: "speaker", subject_x: 0.72 }], 30)[0].subject_x).toBe(0.72);
+  });
+});
