@@ -32,7 +32,10 @@ const ANALYSE_STALE_MS = 12 * 60 * 1000;
 
 function stale(clip: Clip): boolean {
   if (clip.status !== "analysing") return false;
-  const updated = Date.parse(clip.updated_at.replace(" ", "T") + "Z");
+  // The server sends SQLite UTC ("YYYY-MM-DD HH:MM:SS", no zone); an
+  // optimistic local update sends ISO. Read both as UTC.
+  const at = clip.updated_at.includes("T") ? clip.updated_at : clip.updated_at.replace(" ", "T") + "Z";
+  const updated = Date.parse(at);
   return !Number.isFinite(updated) || Date.now() - updated > ANALYSE_STALE_MS;
 }
 
