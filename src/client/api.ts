@@ -56,12 +56,19 @@ export interface Run {
   created_at: string;
 }
 
-export class ApiError extends Error {}
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public status: number,
+  ) {
+    super(message);
+  }
+}
 
 async function handle<T>(res: Response): Promise<T> {
   if (res.status === 204) return null as T;
   const body = await res.json().catch(() => null);
-  if (!res.ok) throw new ApiError((body as { detail?: string; error?: string })?.detail ?? (body as { error?: string })?.error ?? `Request failed (${res.status})`);
+  if (!res.ok) throw new ApiError((body as { detail?: string; error?: string })?.detail ?? (body as { error?: string })?.error ?? `Request failed (${res.status})`, res.status);
   return body as T;
 }
 

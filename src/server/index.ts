@@ -321,7 +321,17 @@ async function advance(env: Bindings, source: Source): Promise<Source> {
 
   const captions = m.captions?.find((x) => x.language === source.language);
   if (!m.download || !captions) {
-    const p = await media.prepare(cfg, source.media_id, source.language);
+    let p: MediaStatus;
+    try {
+      p = await media.prepare(cfg, source.media_id, source.language);
+    } catch (err) {
+      // A 4xx is about the video itself (e.g. no audio to transcribe) and
+      // won't change on retry; a 5xx may, so it's left to the next read.
+      if (err instanceof ServiceError && err.status < 500) {
+        return setSource(source.id, { status: "failed", error: err.message, ...facts });
+      }
+      throw err;
+    }
     return setSource(source.id, { status: "preparing", progress: p.download?.percent ?? null, ...facts });
   }
   if (m.download.status === "error" || captions.status === "error") {

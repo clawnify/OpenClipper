@@ -11,7 +11,7 @@ import {
   Undo2,
   X,
 } from "lucide-react";
-import { api, clock, type Clip, type ClipLength, type Run, type Source } from "./api";
+import { api, ApiError, clock, type Clip, type ClipLength, type Run, type Source } from "./api";
 import { StatusBadge } from "./sources";
 import { btnGhost, btnIcon, btnPrimary, btnSecondary, card, Dialog, EmptyState, Kbd } from "./ui";
 
@@ -66,6 +66,7 @@ const PREP_COPY: Record<string, string> = {
 export function SourcePage({ id, navigate }: { id: string; navigate: (to: string) => void }) {
   const [data, setData] = useState<Detail | null>(null);
   const [missing, setMissing] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [thumb, setThumb] = useState<string | null>(null);
   const [finding, setFinding] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -76,14 +77,23 @@ export function SourcePage({ id, navigate }: { id: string; navigate: (to: string
     () =>
       api
         .get<Detail>(`/api/sources/${id}`)
-        .then(setData)
-        .catch(() => setMissing(true)),
+        .then((d) => {
+          setData(d);
+          setLoadError(null);
+        })
+        .catch((err) => {
+          // Only a 404 means the video is gone. Anything else is shown as
+          // itself; while polling, the last good state stays on screen.
+          if (err instanceof ApiError && err.status === 404) setMissing(true);
+          else setLoadError(err instanceof Error ? err.message : String(err));
+        }),
     [id],
   );
 
   useEffect(() => {
     setData(null);
     setMissing(false);
+    setLoadError(null);
     load();
   }, [load]);
 
@@ -165,6 +175,22 @@ export function SourcePage({ id, navigate }: { id: string; navigate: (to: string
           action={
             <button className={btnSecondary} onClick={() => navigate("/")}>
               Back to videos
+            </button>
+          }
+        />
+      </main>
+    );
+  }
+  if (!data && loadError) {
+    return (
+      <main className="flex-1 overflow-y-auto">
+        <EmptyState
+          icon={<X className="w-8 h-8" />}
+          title="This video couldn't be loaded"
+          body={loadError}
+          action={
+            <button className={btnSecondary} onClick={load}>
+              Try again
             </button>
           }
         />
