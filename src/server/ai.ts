@@ -121,7 +121,9 @@ Times: when a moment starts or ends on speech, use the transcript line's time so
 For each moment also say how it is shot, stretch by stretch (segments) — it will be re-framed from 16:9 to vertical 9:16: a person is cropped around their face; a screen is shown whole.
 ${opts.brief ? `\nThe brief — who the clips are for and what they're for:\n${opts.brief}\n` : ""}
 ${transcript}`;
-  return { prompt, schema: FIND_SCHEMA, thinking: "medium", max_output_tokens: 32_000 };
+  // Generous on purpose: 25 moments with their segments are ~10k tokens plus
+  // thinking, and a budget hit fails the whole find.
+  return { prompt, schema: FIND_SCHEMA, thinking: "medium", max_output_tokens: 48_000 };
 }
 
 export interface FoundMoment {

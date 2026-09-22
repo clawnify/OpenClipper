@@ -7,7 +7,7 @@ import { btnGhost, btnIcon, btnPrimary, btnSecondary, ConfirmDialog, Dialog, Emp
 const STATUS: Record<Source["status"], { label: string; tone: string }> = {
   uploading: { label: "Uploading", tone: "bg-info-tint text-info border-info/30" },
   processing: { label: "Processing", tone: "bg-info-tint text-info border-info/30" },
-  preparing: { label: "Transcribing", tone: "bg-info-tint text-info border-info/30" },
+  preparing: { label: "Preparing", tone: "bg-info-tint text-info border-info/30" },
   ready: { label: "Ready", tone: "bg-success-tint text-success border-success/30" },
   failed: { label: "Failed", tone: "bg-danger-tint text-danger border-danger/30" },
 };

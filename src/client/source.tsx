@@ -428,8 +428,9 @@ function FindPanel({
     <section className={`${card} p-5`}>
       <div className="text-micro uppercase text-muted">Find the clips</div>
       <p className="mt-1 text-body-sm text-muted max-w-2xl">
-        The whole transcript is read at once, so the picks are the strongest in the video — not just the first good
-        ones. Each clip opens on its hook and ends on a finished thought.
+        The whole video is watched and listened to at once, so the picks are the strongest in it — not just the first
+        good ones, and not only what is said: a sound or a picture can carry a clip. Each clip opens on its hook and
+        ends on a finished payoff.
       </p>
       <label className="block mt-4">
         <span className="text-label">Who are the clips for? (optional)</span>
