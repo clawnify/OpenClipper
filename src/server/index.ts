@@ -321,7 +321,7 @@ async function advance(env: Bindings, source: Source): Promise<Source> {
 
   const captions = m.captions?.find((x) => x.language === source.language);
   if (!m.download || !captions) {
-    let p: MediaStatus;
+    let p: MediaStatus & { no_audio?: boolean };
     try {
       p = await media.prepare(cfg, source.media_id, source.language);
     } catch (err) {
@@ -331,6 +331,14 @@ async function advance(env: Bindings, source: Source): Promise<Source> {
         return setSource(source.id, { status: "failed", error: err.message, ...facts });
       }
       throw err;
+    }
+    // A silent video has nothing to transcribe. It's still usable: it becomes
+    // ready with an empty transcript ("" — known to be empty, unlike null).
+    if (p.no_audio && p.download?.status === "ready") {
+      return setSource(source.id, { status: "ready", progress: null, error: null, transcript: "", ...facts });
+    }
+    if (p.no_audio && p.download?.status === "error") {
+      return setSource(source.id, { status: "failed", error: "preparing the video failed — delete it and upload again", ...facts });
     }
     return setSource(source.id, { status: "preparing", progress: p.download?.percent ?? null, ...facts });
   }
@@ -396,8 +404,14 @@ app.post("/api/sources/:id/find", async (c) => {
   const b = await c.req.json<{ brief?: string; max_clips?: number; clip_length?: string }>().catch(() => ({}) as never);
   const source = await get<Source>("SELECT * FROM sources WHERE id = ?", [c.req.param("id")]);
   if (!source) return c.json({ error: "not_found" }, 404);
-  if (source.status !== "ready" || !source.transcript || !source.duration) {
+  if (source.status !== "ready" || source.transcript == null || !source.duration) {
     return c.json({ error: "not_ready", detail: "the video is still being prepared" }, 409);
+  }
+  if (!source.transcript) {
+    return c.json(
+      { error: "no_audio", detail: "This video has no sound, so there is no speech to find moments in." },
+      409,
+    );
   }
   const cues = parseVtt(source.transcript);
   if (cues.length === 0) {
@@ -615,7 +629,7 @@ app.post("/api/clips/:id/render", async (c) => {
     clip.status === "saving" ||
     ((clip.status === "rendering" || clip.status === "analysing") && !isStale(clip));
   if (inFlight) return c.json({ error: "already_running", detail: "this clip is already rendering" }, 409);
-  if (!source.transcript || !source.width || !source.height) {
+  if (source.transcript == null || !source.width || !source.height) {
     return c.json({ error: "not_ready", detail: "the video is still being prepared" }, 409);
   }
   if (!clip.layout) clip = await analyzeClip(c.env, clip, source);
