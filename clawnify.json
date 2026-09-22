@@ -1,0 +1,39 @@
+{
+  "$schema": "https://app.clawnify.com/schema/v1/clawnify.json",
+  "version": 1,
+  "name": "OpenClipper",
+  "description": "Turn a long video into short vertical clips. Upload a podcast, tutorial or talk (hours long, up to 30 GB), and OpenClipper finds the strongest moments, cuts them on clean sentence boundaries, lays each one out for 9:16 and burns in captions. Every clip is yours to trim, drop or re-render.",
+  "icon": "icon.svg",
+  "tags": ["video", "clips", "shorts", "reels", "captions", "repurposing"],
+  "app": {
+    "framework": "react+hono",
+    "database": true,
+    "storage": true
+  },
+  "env": {
+    "required": ["OPENROUTER_API_KEY"]
+  },
+  "deploy": {
+    "title": "Deploy your OpenClipper",
+    "subtitle": "Long videos in, captioned vertical clips out.",
+    "prompts": [
+      {
+        "key": "brand_name",
+        "label": "Brand or channel name",
+        "placeholder": "e.g. Northwind Studio",
+        "required": true
+      },
+      {
+        "key": "content",
+        "label": "What are your long videos?",
+        "placeholder": "e.g. 2-hour synth plugin walkthroughs, weekly podcast episodes"
+      },
+      {
+        "key": "audience",
+        "label": "Who are the clips for, and where do they go?",
+        "placeholder": "e.g. music producers on YouTube Shorts and Instagram Reels"
+      }
+    ]
+  },
+  "agent": "agent.md"
+}
