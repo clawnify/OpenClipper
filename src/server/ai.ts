@@ -9,6 +9,14 @@
 
 export const MODEL = "google/gemini-3.8-flash";
 
+/** How long the clips should run — the one control every clipping tool has. */
+export const CLIP_LENGTHS = {
+  short: { min: 15, max: 30, label: "under 30 seconds" },
+  standard: { min: 30, max: 60, label: "30 to 60 seconds" },
+  long: { min: 60, max: 90, label: "60 to 90 seconds" },
+} as const;
+export type ClipLength = keyof typeof CLIP_LENGTHS;
+
 export interface Moment {
   title: string;
   hook: string;
@@ -93,7 +101,9 @@ export async function selectMoments(opts: {
   duration: number;
   brief: string;
   maxClips: number;
+  clipLength: ClipLength;
 }): Promise<MomentPick> {
+  const band = CLIP_LENGTHS[opts.clipLength];
   const prompt = `You are the best short-form video editor alive. Below is the full timed transcript of a long video (${Math.round(opts.duration / 60)} minutes). Each line is "[timestamp] words" — the timestamp is when that line starts.
 
 Pick up to ${opts.maxClips} moments to publish as standalone vertical clips (YouTube Shorts, Reels, TikTok).
@@ -102,7 +112,7 @@ What makes a moment:
 - It stands alone: a viewer who never saw the video understands it from its first second. No "as I said earlier", no dangling "this" or "that one" pointing at something outside the clip.
 - It opens on a hook: a claim, a surprising result, a question, a before/after, a strong opinion. Start ON that line — never on filler, greetings, "so", "um", or setup the hook doesn't need.
 - It ends on a completed thought — the payoff, the result, the punchline — not mid-explanation.
-- 20 to 60 seconds long. 30–45 is the sweet spot.
+- ${band.min} to ${band.max} seconds long (${band.label}). A moment that genuinely needs a little longer to land its payoff may run a few seconds over; never pad one to reach the length.
 - Moments never overlap, and never repeat the same idea: if two moments teach the same thing, keep the stronger.
 
 Quality over count: return FEWER than ${opts.maxClips} if the video doesn't have that many strong moments. Padding the list with weak clips is the worst outcome. Order the list strongest first.

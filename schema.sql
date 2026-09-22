@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS runs (
   source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
   brief TEXT NOT NULL DEFAULT '',
   max_clips INTEGER NOT NULL DEFAULT 25,
+  -- short (<30 s) | standard (30–60 s) | long (60–90 s)
+  clip_length TEXT NOT NULL DEFAULT 'standard',
   model TEXT NOT NULL,
   -- The model's own note on what it found (and why there may be fewer clips).
   notes TEXT,
@@ -74,9 +76,13 @@ CREATE TABLE IF NOT EXISTS clips (
   layout TEXT,
   captions INTEGER NOT NULL DEFAULT 1,
   show_title INTEGER NOT NULL DEFAULT 1,
-  -- proposed → analysing → rendering → rendered | failed; rejected = dropped.
+  -- proposed → analysing → rendering → saving → rendered | failed;
+  -- rejected = dropped.
   status TEXT NOT NULL DEFAULT 'proposed',
   error TEXT,
+  -- The platform render job producing this clip. Renders run on the server
+  -- and outlive any page: the clip advances when it is next read.
+  render_job_id TEXT,
   output_key TEXT,
   output_size INTEGER,
   rendered_at TEXT,

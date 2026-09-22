@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { initDB, query, get, run } from "./db";
-import { media, renderEdit, ServiceError, type MediaStatus, type ServicesConfig } from "./services";
-import { MODEL, readLayout, selectMoments } from "./ai";
+import { media, renderStatus, startRender, ServiceError, type MediaStatus, type ServicesConfig } from "./services";
+import { MODEL, readLayout, selectMoments, CLIP_LENGTHS, type ClipLength } from "./ai";
 import { captionChunks, parseVtt, snapWindow, transcriptForModel, type Cue } from "./transcript";
 import { normalizeSegments, type LayoutSegment } from "./layout";
 import { buildClipEdl } from "./edl";
@@ -29,10 +29,17 @@ type Bindings = {
 type C = { Bindings: Bindings };
 const app = new Hono<C>();
 
-const MAX_CLIPS = 30;
-// Shorter than this is a quote card, longer stops being a short.
-const MIN_CLIP = 12;
-const MAX_CLIP = 75;
+// A ceiling on proposals, not a target: proposing is cheap (one model pass),
+// rendering is the step a person chooses clip by clip.
+const MAX_CLIPS = 50;
+// When the caller names no maximum: about one proposal per three minutes of
+// source, which lands where the market sits for long videos (32–55 for 1–2 h+).
+function defaultMaxClips(durationSeconds: number): number {
+  return Math.min(MAX_CLIPS, Math.max(3, Math.round(durationSeconds / 180)));
+}
+// Trim bounds for an edited clip, across every length choice.
+const TRIM_MIN = 6;
+const TRIM_MAX = 95;
 // Frames sampled through a clip to read its layout.
 const FRAME_STEP = 2;
 
@@ -94,8 +101,9 @@ interface Clip {
   layout: string | null;
   captions: number;
   show_title: number;
-  status: "proposed" | "analysing" | "rendering" | "rendered" | "failed" | "rejected";
+  status: "proposed" | "analysing" | "rendering" | "saving" | "rendered" | "failed" | "rejected";
   error: string | null;
+  render_job_id: string | null;
   output_key: string | null;
   output_size: number | null;
   rendered_at: string | null;
@@ -108,6 +116,7 @@ interface Run {
   source_id: string;
   brief: string;
   max_clips: number;
+  clip_length: ClipLength;
   model: string;
   notes: string | null;
   created_at: string;
@@ -225,12 +234,68 @@ app.get("/api/sources/:id", async (c) => {
   if (source.status !== "ready" && source.status !== "failed") {
     source = await advance(c.env, source);
   }
-  const [clips, runRow] = await Promise.all([
+  const [rows, runRow] = await Promise.all([
     query<Clip>("SELECT * FROM clips WHERE source_id = ? ORDER BY status = 'rejected', rank, start_s", [source.id]),
     get<Run>("SELECT * FROM runs WHERE source_id = ? ORDER BY created_at DESC LIMIT 1", [source.id]),
   ]);
+  const clips = await Promise.all(rows.map((clip) => advanceRender(c.env, clip)));
   return c.json({ source: publicSource(source), clips: clips.map(publicClip), run: runRow ?? null });
 });
+
+/**
+ * Move a rendering clip forward from what the platform says about its job.
+ * Renders run on the platform, not in any request of ours, so the page that
+ * started one can be closed — the next read picks the result up.
+ *
+ * Safe to run from overlapping reads: a finished job is copied to a key
+ * derived from the job itself, so two readers write the same bytes to the
+ * same place and the same values to the row. No claim is needed.
+ */
+async function advanceRender(env: Bindings, clip: Clip): Promise<Clip> {
+  if (!clip.render_job_id) {
+    // Left over from before renders ran on the platform: no job to ask about.
+    if (clip.status === "rendering" && isStale(clip)) {
+      return setClip(clip.id, { status: "failed", error: "the render was lost — render it again" });
+    }
+    return clip;
+  }
+  const working = clip.status === "rendering" || (clip.status === "saving" && isStale(clip, SAVING_STALE_MS));
+  if (!working) return clip;
+
+  let job;
+  try {
+    job = await renderStatus(services(env), clip.render_job_id);
+  } catch (err) {
+    // The platform forgot the job (e.g. expired) — a render nobody can finish.
+    if (err instanceof ServiceError && err.status === 404) {
+      return setClip(clip.id, { status: "failed", error: "the render was lost — render it again" });
+    }
+    return clip; // a blip reading status must not fail a render that is running
+  }
+  if (job.status === "failed") {
+    return setClip(clip.id, { status: "failed", error: (job.detail ?? "the render failed").slice(0, 500) });
+  }
+  if (job.status !== "done" || !job.url) return clip;
+
+  await setClip(clip.id, { status: "saving" });
+  try {
+    // The platform's link expires; the clip should not.
+    const res = await fetch(job.url);
+    if (!res.ok || !res.body) throw new Error(`could not fetch the rendered clip (${res.status})`);
+    const size = Number(res.headers.get("content-length") ?? job.size);
+    const key = `clips/${clip.id}-${clip.render_job_id}.mp4`;
+    const fixed = new FixedLengthStream(size);
+    const pipe = res.body.pipeTo(fixed.writable);
+    await env.UPLOADS.put(key, fixed.readable, { httpMetadata: { contentType: "video/mp4" } });
+    await pipe;
+    if (clip.output_key && clip.output_key !== key) await env.UPLOADS.delete(clip.output_key);
+    return setClip(clip.id, { status: "rendered", output_key: key, output_size: size, rendered_at: new Date().toISOString() });
+  } catch {
+    // Leave it rendering: the job's output is kept on the platform, so the
+    // next read tries the copy again.
+    return setClip(clip.id, { status: "rendering" });
+  }
+}
 
 async function advance(env: Bindings, source: Source): Promise<Source> {
   const cfg = services(env);
@@ -318,7 +383,7 @@ app.get("/api/sources/:id/playback", async (c) => {
 // One pass of the model over the whole transcript. Replaces the clips from
 // earlier passes that were never rendered; rendered clips are kept.
 app.post("/api/sources/:id/find", async (c) => {
-  const b = await c.req.json<{ brief?: string; max_clips?: number }>().catch(() => ({}) as never);
+  const b = await c.req.json<{ brief?: string; max_clips?: number; clip_length?: string }>().catch(() => ({}) as never);
   const source = await get<Source>("SELECT * FROM sources WHERE id = ?", [c.req.param("id")]);
   if (!source) return c.json({ error: "not_found" }, 404);
   if (source.status !== "ready" || !source.transcript || !source.duration) {
@@ -328,7 +393,8 @@ app.post("/api/sources/:id/find", async (c) => {
   if (cues.length === 0) {
     return c.json({ error: "no_speech", detail: "no speech was found in this video, so there's nothing to cut on" }, 422);
   }
-  const maxClips = Math.min(MAX_CLIPS, Math.max(1, Math.round(b.max_clips ?? 25)));
+  const maxClips = Math.min(MAX_CLIPS, Math.max(1, Math.round(b.max_clips ?? defaultMaxClips(source.duration))));
+  const clipLength: ClipLength = b.clip_length && b.clip_length in CLIP_LENGTHS ? (b.clip_length as ClipLength) : "standard";
   const brief = (b.brief ?? "").trim().slice(0, 2000);
 
   const pick = await selectMoments({
@@ -337,15 +403,17 @@ app.post("/api/sources/:id/find", async (c) => {
     duration: source.duration,
     brief,
     maxClips,
+    clipLength,
   });
 
   const rendered = await query<Clip>("SELECT * FROM clips WHERE source_id = ? AND status = 'rendered'", [source.id]);
-  const windows = snapMoments(cues, pick.moments, source.duration, rendered);
+  const windows = snapMoments(cues, pick.moments, source.duration, rendered, clipLength);
 
-  await run("INSERT INTO runs (source_id, brief, max_clips, model, notes) VALUES (?, ?, ?, ?, ?)", [
+  await run("INSERT INTO runs (source_id, brief, max_clips, clip_length, model, notes) VALUES (?, ?, ?, ?, ?, ?)", [
     source.id,
     brief,
     maxClips,
+    clipLength,
     MODEL,
     pick.notes,
   ]);
@@ -367,14 +435,20 @@ function snapMoments(
   moments: { title: string; hook: string; reason: string; start: number; end: number }[],
   duration: number,
   keep: Clip[],
+  length: ClipLength,
 ) {
+  // Snapping to speech moves the ends a little; allow slack either side of
+  // the requested band rather than dropping a good moment over a second.
+  const band = CLIP_LENGTHS[length];
+  const min = Math.max(TRIM_MIN, band.min - 5);
+  const max = band.max + 8;
   const taken: { start: number; end: number }[] = keep.map((k) => ({ start: k.start_s, end: k.end_s }));
   const out: { title: string; hook: string; reason: string; start: number; end: number }[] = [];
   for (const m of moments) {
     const w = snapWindow(cues, { start: m.start, end: m.end }, duration);
     if (!w) continue;
     const len = w.end - w.start;
-    if (len < MIN_CLIP || len > MAX_CLIP) continue;
+    if (len < min || len > max) continue;
     if (taken.some((t) => w.start < t.end - 1 && w.end > t.start + 1)) continue;
     taken.push(w);
     out.push({ ...m, ...w });
@@ -415,8 +489,8 @@ app.patch("/api/clips/:id", async (c) => {
   if (b.start_s !== undefined || b.end_s !== undefined) {
     const start = Math.max(0, b.start_s ?? clip.start_s);
     const end = Math.min(source.duration ?? Infinity, b.end_s ?? clip.end_s);
-    if (!(end - start >= MIN_CLIP / 2 && end - start <= MAX_CLIP)) {
-      return c.json({ error: "invalid_request", detail: `a clip runs ${MIN_CLIP / 2}–${MAX_CLIP} seconds` }, 422);
+    if (!(end - start >= TRIM_MIN && end - start <= TRIM_MAX)) {
+      return c.json({ error: "invalid_request", detail: `a clip runs ${TRIM_MIN}–${TRIM_MAX} seconds` }, 422);
     }
     patch.start_s = Math.round(start * 1000) / 1000;
     patch.end_s = Math.round(end * 1000) / 1000;
@@ -447,16 +521,10 @@ app.post("/api/clips/:id/analyze", async (c) => {
 
 async function analyzeClip(env: Bindings, clip: Clip, source: Source): Promise<Clip> {
   const duration = clip.end_s - clip.start_s;
-  const { thumbnail } = await media.playback(services(env), source.media_id);
-  const frames: { t: number; url: string }[] = [];
-  for (let t = 0.5; t < duration; t += FRAME_STEP) {
-    // Stream thumbnails take whole seconds.
-    const at = Math.floor(clip.start_s + t);
-    frames.push({ t: at - clip.start_s, url: thumbnail.replace("{time}", String(at)) });
-  }
   const prev = clip.status;
   await setClip(clip.id, { status: "analysing", error: null });
   try {
+    const frames = await clipFrames(env, source, clip, duration);
     const read = await readLayout({ key: modelKey(env), frames, duration });
     const segments = normalizeSegments(read.segments ?? [], Math.round(duration * 1000) / 1000);
     return await setClip(clip.id, { layout: JSON.stringify(segments), status: prev === "analysing" ? "proposed" : prev });
@@ -466,36 +534,77 @@ async function analyzeClip(env: Bindings, clip: Clip, source: Source): Promise<C
   }
 }
 
-// A render that is still marked "rendering" this long after its last update
-// is not running any more: the worker that drove it is gone. Retryable.
-const RENDER_STALE_MS = 12 * 60 * 1000;
-
-function isStale(clip: Clip): boolean {
-  // SQLite datetime('now') is UTC without a zone marker.
-  const updated = Date.parse(clip.updated_at.replace(" ", "T") + "Z");
-  return !Number.isFinite(updated) || Date.now() - updated > RENDER_STALE_MS;
+/**
+ * The frames the model reads, as image bytes — fetched HERE and sent inline.
+ *
+ * The thumbnail URLs carry a signed playback token, and that token opens the
+ * whole video's stream for as long as it lives, not just one frame. Handing
+ * the URLs to the model provider would give a third party the client's
+ * footage; sending the few kilobytes of each frame gives it nothing else.
+ */
+async function clipFrames(
+  env: Bindings,
+  source: Source,
+  clip: Clip,
+  duration: number,
+): Promise<{ t: number; url: string }[]> {
+  const { thumbnail } = await media.playback(services(env), source.media_id);
+  const times: number[] = [];
+  for (let t = 0.5; t < duration; t += FRAME_STEP) {
+    // Stream thumbnails take whole seconds.
+    times.push(Math.floor(clip.start_s + t));
+  }
+  const frames = await Promise.all(
+    times.map(async (at) => {
+      const res = await fetch(thumbnail.replace("{time}", String(at)));
+      if (!res.ok) return null;
+      const type = res.headers.get("content-type")?.split(";")[0] || "image/jpeg";
+      return { t: at - clip.start_s, url: `data:${type};base64,${toBase64(new Uint8Array(await res.arrayBuffer()))}` };
+    }),
+  );
+  const got = frames.filter((f): f is { t: number; url: string } => f !== null);
+  if (got.length === 0) throw new Error("could not read any frames of this clip");
+  return got;
 }
 
-// Render one clip to a vertical MP4 and keep it in this app's storage.
-//
-// The work happens INSIDE this request, which is why the caller must keep it
-// open (the UI does, and reconnects by polling). Measured the hard way: doing
-// it in the background with waitUntil() looked right and silently lost the
-// job — three clips accepted at 18:24 were still "rendering" fourteen minutes
-// later, past the edit service's own 8-minute timeout, so not even the error
-// handler had run. A clip left mid-render is recovered by the staleness rule
-// below rather than by hoping the runtime keeps working after the response.
-// (Ceiling: move to the platform's /queue when a run is more clips than a
-// person wants to sit through.)
+function toBase64(bytes: Uint8Array): string {
+  let binary = "";
+  // Chunked: spreading a large array into fromCharCode overflows the stack.
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(binary);
+}
+
+// A clip "analysing" or (for a render started before renders ran on the
+// platform) "rendering" with no job this long after its last update has lost
+// the request that drove it. Retryable.
+const RENDER_STALE_MS = 12 * 60 * 1000;
+// A copy of a finished render that hasn't completed in this long was cut
+// short; the next read starts it again.
+const SAVING_STALE_MS = 3 * 60 * 1000;
+
+function isStale(clip: Clip, windowMs = RENDER_STALE_MS): boolean {
+  // SQLite datetime('now') is UTC without a zone marker.
+  const updated = Date.parse(clip.updated_at.replace(" ", "T") + "Z");
+  return !Number.isFinite(updated) || Date.now() - updated > windowMs;
+}
+
+// Render one clip to a vertical MP4. Starts the render on the platform and
+// answers at once: the render runs in the workspace's render container, not in
+// this request, so closing the page can't lose it. GET /api/sources/:id picks
+// the result up (see advanceRender).
 app.post("/api/clips/:id/render", async (c) => {
   const found = await loadClip(c.req.param("id"));
   if (!found) return c.json({ error: "not_found" }, 404);
   let { clip } = found;
   const { source } = found;
   if (clip.status === "rejected") return c.json({ error: "invalid_request", detail: "restore the clip first" }, 409);
-  if ((clip.status === "rendering" || clip.status === "analysing") && !isStale(clip)) {
-    return c.json({ error: "already_running", detail: "this clip is already rendering" }, 409);
-  }
+  const inFlight =
+    (clip.status === "rendering" && clip.render_job_id) ||
+    clip.status === "saving" ||
+    ((clip.status === "rendering" || clip.status === "analysing") && !isStale(clip));
+  if (inFlight) return c.json({ error: "already_running", detail: "this clip is already rendering" }, 409);
   if (!source.transcript || !source.width || !source.height) {
     return c.json({ error: "not_ready", detail: "the video is still being prepared" }, 409);
   }
@@ -512,27 +621,10 @@ app.post("/api/clips/:id/render", async (c) => {
     title: clip.show_title ? clip.title : null,
   });
 
-  await setClip(clip.id, { status: "rendering", error: null });
-  const previousOutput = clip.output_key;
   try {
-    const out = await renderEdit(services(c.env), edl, `${slug(clip.title)}.mp4`);
-    // The service's link expires; the clip should not.
-    const res = await fetch(out.url);
-    if (!res.ok || !res.body) throw new Error(`could not fetch the rendered clip (${res.status})`);
-    const size = Number(res.headers.get("content-length") ?? out.size);
-    const key = `clips/${clip.id}-${Date.now()}.mp4`;
-    const fixed = new FixedLengthStream(size);
-    const pipe = res.body.pipeTo(fixed.writable);
-    await c.env.UPLOADS.put(key, fixed.readable, { httpMetadata: { contentType: "video/mp4" } });
-    await pipe;
-    if (previousOutput) await c.env.UPLOADS.delete(previousOutput);
-    const done = await setClip(clip.id, {
-      status: "rendered",
-      output_key: key,
-      output_size: size,
-      rendered_at: new Date().toISOString(),
-    });
-    return c.json(publicClip(done));
+    const job = await startRender(services(c.env), edl, `${slug(clip.title)}.mp4`);
+    const started = await setClip(clip.id, { status: "rendering", error: null, render_job_id: job.job_id });
+    return c.json(publicClip(started), 202);
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     const failed = await setClip(clip.id, { status: "failed", error: detail.slice(0, 500) });

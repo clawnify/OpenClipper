@@ -79,9 +79,25 @@ export const media = {
   remove: (cfg: ServicesConfig, id: string) => call<null>(cfg, `/media/${id}`, { method: "DELETE" }),
 };
 
-export function renderEdit(cfg: ServicesConfig, edl: unknown, filename: string) {
-  return call<{ url: string; duration: number; size: number }>(cfg, "/video/edit", {
+/**
+ * Start a render on the platform and return at once. The render runs in the
+ * workspace's render container and outlives this request; its result is read
+ * with renderStatus. Renders queue there one at a time.
+ */
+export function startRender(cfg: ServicesConfig, edl: unknown, filename: string) {
+  return call<{ job_id: string; status: string }>(cfg, "/video/edit", {
     method: "POST",
-    body: JSON.stringify({ edl, quality: "standard", filename }),
+    body: JSON.stringify({ edl, quality: "standard", filename, async: true }),
   });
+}
+
+export interface RenderStatus {
+  status: "queued" | "running" | "done" | "failed";
+  url?: string;
+  size?: number;
+  detail?: string;
+}
+
+export function renderStatus(cfg: ServicesConfig, jobId: string) {
+  return call<RenderStatus>(cfg, `/video/edit/${jobId}`);
 }

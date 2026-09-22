@@ -36,7 +36,7 @@ export interface Clip {
   layout: LayoutSegment[] | null;
   captions: boolean;
   show_title: boolean;
-  status: "proposed" | "analysing" | "rendering" | "rendered" | "failed" | "rejected";
+  status: "proposed" | "analysing" | "rendering" | "saving" | "rendered" | "failed" | "rejected";
   error: string | null;
   file_url: string | null;
   output_size: number | null;
@@ -44,10 +44,13 @@ export interface Clip {
   updated_at: string;
 }
 
+export type ClipLength = "short" | "standard" | "long";
+
 export interface Run {
   id: string;
   brief: string;
   max_clips: number;
+  clip_length: ClipLength;
   model: string;
   notes: string | null;
   created_at: string;

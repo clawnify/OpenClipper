@@ -11,32 +11,42 @@ import {
   Undo2,
   X,
 } from "lucide-react";
-import { api, clock, type Clip, type Run, type Source } from "./api";
+import { api, clock, type Clip, type ClipLength, type Run, type Source } from "./api";
 import { StatusBadge } from "./sources";
 import { btnGhost, btnIcon, btnPrimary, btnSecondary, card, Dialog, EmptyState, Kbd } from "./ui";
 
 // Who the clips are for, when a run has no brief of its own. Set from the
 // deploy answers (see agent.md).
 const DEFAULT_BRIEF = "";
-const DEFAULT_COUNT = 25;
+// Same ceiling and default as the server: about one clip per three minutes
+// of video, never fewer than 3.
+const MAX_CLIPS = 50;
+function defaultCount(duration: number | null): number {
+  return Math.min(MAX_CLIPS, Math.max(3, Math.round((duration ?? 0) / 180)));
+}
 const POLL_MS = 5000;
-// A clip still "rendering" this long after its last update is orphaned — the
-// server says the same, and offers it for retry rather than leaving it stuck.
-const RENDER_STALE_MS = 12 * 60 * 1000;
+// Reading a clip's shots happens inside the render request. One still
+// "analysing" this long after its last update lost that request — the server
+// says the same, and lets it be rendered again.
+const ANALYSE_STALE_MS = 12 * 60 * 1000;
 
 function stale(clip: Clip): boolean {
+  if (clip.status !== "analysing") return false;
   const updated = Date.parse(clip.updated_at.replace(" ", "T") + "Z");
-  return !Number.isFinite(updated) || Date.now() - updated > RENDER_STALE_MS;
+  return !Number.isFinite(updated) || Date.now() - updated > ANALYSE_STALE_MS;
 }
 
-/** Rendering is server-side; this is how the page learns it finished. */
+/**
+ * Renders run on the platform, queued one at a time in the workspace's render
+ * container — a clip can wait its turn for a while, and the server is the one
+ * that knows when it's done. This is only whether to keep asking.
+ */
 function working(clip: Clip): boolean {
-  return (clip.status === "rendering" || clip.status === "analysing") && !stale(clip);
+  return clip.status === "rendering" || clip.status === "saving" || (clip.status === "analysing" && !stale(clip));
 }
-// Renders in flight at once. One: a workspace gets a single render container,
-// so two clips do not go twice as fast — they halve each other's CPU and both
-// creep towards the service's own render timeout.
-const RENDER_CONCURRENCY = 1;
+// Render requests sent at once. Each answers as soon as its clip is queued
+// (after reading the clip's shots), so this only bounds the shot-reading calls.
+const SUBMIT_CONCURRENCY = 3;
 
 interface Detail {
   source: Source;
@@ -56,7 +66,7 @@ export function SourcePage({ id, navigate }: { id: string; navigate: (to: string
   const [thumb, setThumb] = useState<string | null>(null);
   const [finding, setFinding] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [renderQueue, setRenderQueue] = useState<{ done: number; total: number } | null>(null);
+  const [submitting, setSubmitting] = useState(false);
   const [editing, setEditing] = useState<Clip | null>(null);
 
   const load = useCallback(
@@ -97,13 +107,14 @@ export function SourcePage({ id, navigate }: { id: string; navigate: (to: string
   const replaceClip = (c: Clip) =>
     setData((d) => (d ? { ...d, clips: d.clips.map((x) => (x.id === c.id ? c : x)) } : d));
 
-  const find = async (brief: string, maxClips: number) => {
+  const find = async (brief: string, maxClips: number, clipLength: ClipLength) => {
     setFinding(true);
     setError(null);
     try {
       const out = await api.send<{ run: Run; clips: Clip[] }>("POST", `/api/sources/${id}/find`, {
         brief,
         max_clips: maxClips,
+        clip_length: clipLength,
       });
       setData((d) => (d ? { ...d, run: out.run, clips: out.clips } : d));
     } catch (err) {
@@ -113,43 +124,28 @@ export function SourcePage({ id, navigate }: { id: string; navigate: (to: string
     }
   };
 
-  // The render happens inside the request, which takes minutes. Don't wait on
-  // that promise to learn the outcome: poll alongside it, so a dropped
-  // connection (or a reopened page) still sees the clip finish.
+  // Starting a render answers once the clip is queued; the page poll above
+  // follows it from there, so a reload loses nothing.
   const renderOne = async (clip: Clip) => {
-    replaceClip({ ...clip, status: "rendering", error: null, updated_at: new Date().toISOString() });
-    const request = api.send<Clip>("POST", `/api/clips/${clip.id}/render`).catch((err) => {
+    replaceClip({ ...clip, status: "analysing", error: null, updated_at: new Date().toISOString() });
+    try {
+      replaceClip(await api.send<Clip>("POST", `/api/clips/${clip.id}/render`));
+    } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      // "already rendering" is not a failure — the poll below reports the end.
-      return /already rendering/i.test(message) ? null : { __error: message };
-    });
-    void request;
-    for (;;) {
-      await new Promise((r) => setTimeout(r, POLL_MS));
-      let fresh: Clip | undefined;
-      try {
-        const d = await api.get<Detail>(`/api/sources/${clip.source_id}`);
-        fresh = d.clips.find((x) => x.id === clip.id);
-      } catch {
-        continue; // a blip in polling must not fail a render that is running
-      }
-      if (!fresh) return;
-      replaceClip(fresh);
-      if (!working(fresh)) return;
+      // "already rendering" is not a failure — the poll reports the end.
+      if (!/already rendering/i.test(message)) replaceClip({ ...clip, status: "failed", error: message });
+      else load();
     }
   };
 
   const renderAll = async (clips: Clip[]) => {
-    setRenderQueue({ done: 0, total: clips.length });
+    setSubmitting(true);
     const queue = [...clips];
     const worker = async () => {
-      for (let c = queue.shift(); c; c = queue.shift()) {
-        await renderOne(c);
-        setRenderQueue((q) => (q ? { ...q, done: q.done + 1 } : q));
-      }
+      for (let c = queue.shift(); c; c = queue.shift()) await renderOne(c);
     };
-    await Promise.all(Array.from({ length: RENDER_CONCURRENCY }, worker));
-    setRenderQueue(null);
+    await Promise.all(Array.from({ length: SUBMIT_CONCURRENCY }, worker));
+    setSubmitting(false);
   };
 
   const patch = async (clip: Clip, body: Record<string, unknown>) => {
@@ -192,11 +188,13 @@ export function SourcePage({ id, navigate }: { id: string; navigate: (to: string
   const dropped = clips.filter((c) => c.status === "rejected");
   const toRender = live.filter((c) => c.status === "proposed" || c.status === "failed");
   const rendered = live.filter((c) => c.status === "rendered");
+  const inProgress = live.filter(working);
 
   const primary =
-    source.status !== "ready" || live.length === 0 || finding ? null : renderQueue ? (
+    source.status !== "ready" || live.length === 0 || finding ? null : submitting || inProgress.length > 0 ? (
       <button className={`${btnPrimary} shrink-0`} disabled>
-        <Loader2 className="w-4 h-4 animate-spin" /> Rendering {renderQueue.done + 1} of {renderQueue.total}
+        <Loader2 className="w-4 h-4 animate-spin" /> Rendering {inProgress.length}{" "}
+        {inProgress.length === 1 ? "clip" : "clips"}
       </button>
     ) : toRender.length > 0 ? (
       <button className={`${btnPrimary} shrink-0`} onClick={() => renderAll(toRender)}>
@@ -247,6 +245,7 @@ export function SourcePage({ id, navigate }: { id: string; navigate: (to: string
               run={run}
               busy={finding}
               hasClips={clips.length > 0}
+              duration={source.duration}
               onFind={find}
             />
             {error && <p className="mt-3 text-body-sm text-danger">{error}</p>}
@@ -281,7 +280,7 @@ export function SourcePage({ id, navigate }: { id: string; navigate: (to: string
                           key={c.id}
                           clip={c}
                           thumb={thumb}
-                          busy={!!renderQueue}
+                          busy={submitting}
                           stale={stale(c)}
                           onRender={() => renderOne(c)}
                           onEdit={() => setEditing(c)}
@@ -360,16 +359,19 @@ function FindPanel({
   run,
   busy,
   hasClips,
+  duration,
   onFind,
 }: {
   run: Run | null;
   busy: boolean;
   hasClips: boolean;
-  onFind: (brief: string, maxClips: number) => void;
+  duration: number | null;
+  onFind: (brief: string, maxClips: number, clipLength: ClipLength) => void;
 }) {
   const [open, setOpen] = useState(!hasClips);
   const [brief, setBrief] = useState(run?.brief ?? DEFAULT_BRIEF);
-  const [count, setCount] = useState(run?.max_clips ?? DEFAULT_COUNT);
+  const [count, setCount] = useState(run?.max_clips ?? defaultCount(duration));
+  const [length, setLength] = useState<ClipLength>(run?.clip_length ?? "standard");
 
   if (!open) {
     return (
@@ -401,13 +403,29 @@ function FindPanel({
           <input
             type="number"
             min={1}
-            max={30}
+            max={MAX_CLIPS}
             value={count}
-            onChange={(e) => setCount(Math.max(1, Math.min(30, Number(e.target.value) || 1)))}
+            onChange={(e) => setCount(Math.max(1, Math.min(MAX_CLIPS, Number(e.target.value) || 1)))}
             className="mt-1 block w-20 h-9 px-2.5 rounded-sm bg-surface shadow-edge text-body-sm tabular-nums"
           />
         </label>
-        <span className="pb-2 text-fine text-muted">clips — fewer if the video doesn't have that many good ones.</span>
+        <span className="pb-2 text-fine text-muted">clips — only the strong ones, so often fewer.</span>
+        <div className="block">
+          <span className="text-label" id="clip-length">Length</span>
+          <div role="radiogroup" aria-labelledby="clip-length" className="mt-1 flex h-9 rounded-sm bg-surface-sunken p-0.5">
+            {LENGTHS.map(([value, label]) => (
+              <button
+                key={value}
+                role="radio"
+                aria-checked={length === value}
+                onClick={() => setLength(value)}
+                className={`px-2.5 rounded-xs text-body-sm ${length === value ? "bg-surface shadow-edge" : "text-muted"}`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
         <div className="flex-1" />
         {hasClips && (
           <button className={btnGhost} onClick={() => setOpen(false)} disabled={busy}>
@@ -415,7 +433,7 @@ function FindPanel({
           </button>
         )}
         {/* The page's one primary action while no clips exist. */}
-        <button className={hasClips ? btnSecondary : btnPrimary} onClick={() => onFind(brief, count)} disabled={busy}>
+        <button className={hasClips ? btnSecondary : btnPrimary} onClick={() => onFind(brief, count, length)} disabled={busy}>
           {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
           {busy ? "Reading the transcript…" : hasClips ? "Replace unrendered clips" : "Find clips"}
         </button>
@@ -424,6 +442,12 @@ function FindPanel({
     </section>
   );
 }
+
+const LENGTHS: [ClipLength, string][] = [
+  ["short", "Under 30s"],
+  ["standard", "30–60s"],
+  ["long", "60–90s"],
+];
 
 const LAYOUT_LABEL = { speaker: "Speaker", screen: "Screen" } as const;
 
@@ -445,8 +469,8 @@ function ClipCard({
   onDrop: () => void;
 }) {
   const len = Math.round(clip.end_s - clip.start_s);
-  const working = (clip.status === "rendering" || clip.status === "analysing") && !stale;
-  const orphaned = (clip.status === "rendering" || clip.status === "analysing") && stale;
+  const working = (clip.status === "rendering" || clip.status === "saving" || clip.status === "analysing") && !stale;
+  const orphaned = stale;
   const frame = thumb ? thumb.replace("{time}", String(Math.floor(clip.start_s + 1))) : null;
   const layouts = useMemo(() => [...new Set((clip.layout ?? []).map((s) => s.layout))], [clip.layout]);
 
@@ -468,7 +492,7 @@ function ClipCard({
           <div className="absolute inset-0 grid place-items-center bg-foreground/50 text-on-primary">
             <span className="flex items-center gap-2 text-label">
               <Loader2 className="w-4 h-4 animate-spin" />
-              {clip.status === "analysing" ? "Reading the shots…" : "Rendering…"}
+              {clip.status === "analysing" ? "Reading the shots…" : clip.status === "saving" ? "Saving…" : "Rendering…"}
             </span>
           </div>
         )}
