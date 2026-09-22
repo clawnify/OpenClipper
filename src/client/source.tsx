@@ -25,6 +25,8 @@ function defaultCount(duration: number | null): number {
   return Math.min(MAX_CLIPS, Math.max(3, Math.round((duration ?? 0) / 180)));
 }
 const POLL_MS = 5000;
+// What a new find leaves in place — the server's rule too.
+const KEPT = new Set<Clip["status"]>(["rendered", "rendering", "saving"]);
 // Reading a clip's shots happens inside the render request. One still
 // "analysing" this long after its last update lost that request — the server
 // says the same, and lets it be rendered again.
@@ -291,28 +293,30 @@ export function SourcePage({ id, navigate }: { id: string; navigate: (to: string
               <p className="mt-3 text-body-sm text-danger">{run.error}</p>
             )}
 
-            {finding ? (
-              <>
-                <p className="mt-6 text-body-sm text-muted max-w-2xl">
-                  Watching and listening to the whole video. A long video takes a few minutes — you can leave this page
-                  and come back.
-                </p>
-                <div className="mt-3 grid grid-cols-1 lg:grid-cols-2 gap-4">
-                  {[0, 1, 2, 3].map((i) => (
-                    <div key={i} className="flex gap-3 rounded-md bg-surface-sunken/60 p-0 overflow-hidden">
-                      <div className="w-36 sm:w-40 aspect-[9/16] bg-surface-sunken animate-pulse" />
-                      <div className="flex-1 p-3 space-y-2">
-                        <div className="h-2.5 w-1/3 rounded-full bg-surface-sunken animate-pulse" />
-                        <div className="h-3.5 w-3/4 rounded-full bg-surface-sunken animate-pulse" />
-                        <div className="h-3 w-2/3 rounded-full bg-surface-sunken animate-pulse" />
-                      </div>
+            {finding && (
+              <p className="mt-6 text-body-sm text-muted max-w-2xl" role="status">
+                <Loader2 className="inline w-4 h-4 mr-1.5 -mt-0.5 animate-spin" />
+                Watching and listening to the whole video. A long video takes a few minutes — you can leave this page
+                and come back.
+                {live.some((c) => !KEPT.has(c.status)) && " Clips below that aren't rendered yet will be replaced."}
+              </p>
+            )}
+            {finding && live.length === 0 ? (
+              <div className="mt-3 grid grid-cols-1 lg:grid-cols-2 gap-4">
+                {[0, 1, 2, 3].map((i) => (
+                  <div key={i} className="flex gap-3 rounded-md bg-surface-sunken/60 p-0 overflow-hidden">
+                    <div className="w-36 sm:w-40 aspect-[9/16] bg-surface-sunken animate-pulse" />
+                    <div className="flex-1 p-3 space-y-2">
+                      <div className="h-2.5 w-1/3 rounded-full bg-surface-sunken animate-pulse" />
+                      <div className="h-3.5 w-3/4 rounded-full bg-surface-sunken animate-pulse" />
+                      <div className="h-3 w-2/3 rounded-full bg-surface-sunken animate-pulse" />
                     </div>
-                  ))}
-                </div>
-              </>
+                  </div>
+                ))}
+              </div>
             ) : (
               <>
-                {run?.notes && live.length > 0 && (
+                {!finding && run?.notes && live.length > 0 && (
                   <section className="mt-6">
                     <div className="text-micro uppercase text-muted">What the editor found</div>
                     <p className="mt-1 text-body-sm text-muted max-w-3xl">{run.notes}</p>
@@ -323,21 +327,22 @@ export function SourcePage({ id, navigate }: { id: string; navigate: (to: string
                     <div className="text-micro uppercase text-muted mb-3">Clips · strongest first</div>
                     <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
                       {live.map((c) => (
-                        <ClipCard
-                          key={c.id}
-                          clip={c}
-                          thumb={thumb}
-                          busy={submitting}
-                          stale={stale(c)}
-                          onRender={() => renderOne(c)}
-                          onEdit={() => setEditing(c)}
-                          onDrop={() => patch(c, { rejected: true })}
-                        />
+                        <div key={c.id} className={finding && !KEPT.has(c.status) ? "opacity-50" : undefined}>
+                          <ClipCard
+                            clip={c}
+                            thumb={thumb}
+                            busy={submitting}
+                            stale={stale(c)}
+                            onRender={() => renderOne(c)}
+                            onEdit={() => setEditing(c)}
+                            onDrop={() => patch(c, { rejected: true })}
+                          />
+                        </div>
                       ))}
                     </div>
                   </section>
                 )}
-                {run && live.length === 0 && clips.length === 0 && (
+                {!finding && run && live.length === 0 && clips.length === 0 && (
                   <EmptyState
                     icon={<Scissors className="w-8 h-8" />}
                     title="No strong moments found"
@@ -486,7 +491,7 @@ function FindPanel({
           {busy ? "Watching the video…" : hasClips ? "Replace unrendered clips" : "Find clips"}
         </button>
       </div>
-      {hasClips && <p className="mt-2 text-fine text-muted">Rendered clips are kept; the rest are replaced.</p>}
+      {hasClips && <p className="mt-2 text-fine text-muted">Rendered clips (and ones rendering) are kept; the rest are replaced.</p>}
     </section>
   );
 }

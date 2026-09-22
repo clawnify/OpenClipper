@@ -467,11 +467,16 @@ async function advanceRun(env: Bindings, source: Source, runRow: Run): Promise<R
   ]);
   if (claim.changes === 1) {
     const cues = parseVtt(source.transcript ?? "");
-    const rendered = await query<Clip>("SELECT * FROM clips WHERE source_id = ? AND status = 'rendered'", [source.id]);
-    const windows = snapMoments(cues, found.moments, source.duration ?? 0, rendered, runRow.clip_length);
-    await run("DELETE FROM clips WHERE source_id = ? AND status != 'rendered'", [source.id]);
-    // Kept (rendered) clips come first; the new proposals follow, strongest first.
-    const after = rendered.reduce((m, r) => Math.max(m, r.rank), 0);
+    // Rendered clips are kept, and so are ones mid-render: deleting those
+    // would throw away work the person started while this find ran.
+    const kept = await query<Clip>(
+      "SELECT * FROM clips WHERE source_id = ? AND status IN ('rendered', 'rendering', 'saving')",
+      [source.id],
+    );
+    const windows = snapMoments(cues, found.moments, source.duration ?? 0, kept, runRow.clip_length);
+    await run("DELETE FROM clips WHERE source_id = ? AND status NOT IN ('rendered', 'rendering', 'saving')", [source.id]);
+    // Kept clips come first; the new proposals follow, strongest first.
+    const after = kept.reduce((m, r) => Math.max(m, r.rank), 0);
     for (const [i, w] of windows.entries()) {
       await run(
         "INSERT INTO clips (source_id, run_id, rank, title, hook, reason, start_s, end_s, layout) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
