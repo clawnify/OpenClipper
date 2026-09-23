@@ -11,6 +11,8 @@
 //   layoutRequest — the same layout reading for one clip on its own, for clips
 //     that predate it or were moved far by a trim.
 
+import { stamp } from "./transcript";
+
 /** How long the clips should run — the one control every clipping tool has. */
 export const CLIP_LENGTHS = {
   short: { min: 15, max: 30, label: "under 30 seconds" },
@@ -96,14 +98,24 @@ export function findRequest(opts: {
   brief: string;
   maxClips: number;
   clipLength: ClipLength;
+  /** Stretches that already have a clip, or whose clip was dropped. */
+  taken?: { start: number; end: number; title: string; dropped: boolean }[];
 }): AnalysisRequest {
   const band = CLIP_LENGTHS[opts.clipLength];
+  const taken = opts.taken ?? [];
+  // Without this the model re-picks the strongest moments every time — which
+  // already have clips — and spends its picks on duplicates we then drop.
+  const takenText = taken.length
+    ? `\nALREADY TAKEN — these stretches already have a clip, or the editor dropped the clip. Don't pick them again, or anything overlapping them; find other moments:\n${taken
+        .map((t) => `- ${stamp(t.start)}–${stamp(t.end)} ${t.dropped ? "(dropped) " : ""}${t.title}`)
+        .join("\n")}\n`
+    : "";
   const transcript = opts.transcript.trim()
     ? `TRANSCRIPT — machine-made from the audio, so names and jargon may be misheard; trust what you hear and see for those. Each line is "[H:MM:SS.s] words", the time that line starts.\n${opts.transcript}`
     : "There is no transcript: the video has no speech (it may be silent, or music and sound only). Judge it by what you see and hear.";
   const prompt = `You are the best short-form video editor alive. Watch and listen to this whole video (${Math.round(opts.duration / 60)} minutes).
 
-Find up to ${opts.maxClips} moments to publish as standalone vertical clips (YouTube Shorts, Reels, TikTok). Aim to fill the list: a long video usually holds many — every distinct technique, sound, demo, before/after, tip or strong opinion is a candidate.
+Find up to ${opts.maxClips} ${taken.length ? "new " : ""}moments to publish as standalone vertical clips (YouTube Shorts, Reels, TikTok). Aim to fill the list: a long video usually holds many — every distinct technique, sound, demo, before/after, tip or strong opinion is a candidate.
 
 Judge with your eyes and ears, not only the words. A sound demo, a preset playing, a before/after you can HEAR, or something striking on screen can be the strongest moment even with little speech.
 
@@ -119,7 +131,7 @@ Only stop short of ${opts.maxClips} when what's left would not work as a standal
 Times: when a moment starts or ends on speech, use the transcript line's time so no word is cut; otherwise the time you see or hear it.
 
 For each moment also say how it is shot, stretch by stretch (segments) — it will be re-framed from 16:9 to vertical 9:16: a person is cropped around their face; a screen is shown whole.
-${opts.brief ? `\nThe brief — who the clips are for and what they're for:\n${opts.brief}\n` : ""}
+${opts.brief ? `\nThe brief — who the clips are for and what they're for:\n${opts.brief}\n` : ""}${takenText}
 ${transcript}`;
   // Generous on purpose: 25 moments with their segments are ~10k tokens plus
   // thinking, and a budget hit fails the whole find.

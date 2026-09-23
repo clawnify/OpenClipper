@@ -38,7 +38,9 @@ Base URL: this app's own origin. All endpoints are under `/api`.
    /api/sources/{id}` until `run.status` is `done` (the clips are there,
    strongest first) or `failed` (`run.error`). It may return fewer clips than
    asked — that is the quality floor working, not an error. `run.notes` says
-   what it found.
+   what it found. Running it again **adds** clips: nothing is ever removed,
+   and new moments never overlap an existing clip (dropped ones included), so
+   `max_clips` then means at most that many *new* clips.
 4. **Review.** `PATCH /api/clips/{id}` with any of `{ start_s, end_s, title,
    captions, show_title, rejected }`. Moving the window resets the clip's
    layout; any change to a rendered clip marks it for re-rendering.
@@ -62,7 +64,7 @@ Base URL: this app's own origin. All endpoints are under `/api`.
 | PATCH | `/api/sources/{id}` | Rename `{ name }` |
 | DELETE | `/api/sources/{id}` | Delete the video, its clips and their files |
 | GET | `/api/sources/{id}/playback` | Signed HLS + thumbnail (`{time}` → seconds) URLs |
-| POST | `/api/sources/{id}/find` | Start finding moments → `202 { run }` |
+| POST | `/api/sources/{id}/find` | Find (more) moments — additive → `202 { run }` |
 | PATCH | `/api/clips/{id}` | Trim, retitle, toggle captions/title, drop or restore |
 | POST | `/api/clips/{id}/analyze` | Re-read how the clip is shot (after a big trim) |
 | POST | `/api/clips/{id}/render` | Start rendering to MP4 → `202`, the clip |

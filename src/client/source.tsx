@@ -5,7 +5,6 @@ import {
   Film,
   Loader2,
   Pencil,
-  RotateCcw,
   Scissors,
   Sparkles,
   Undo2,
@@ -25,8 +24,6 @@ function defaultCount(duration: number | null): number {
   return Math.min(MAX_CLIPS, Math.max(3, Math.round((duration ?? 0) / 180)));
 }
 const POLL_MS = 5000;
-// What a new find leaves in place — the server's rule too.
-const KEPT = new Set<Clip["status"]>(["rendered", "rendering", "saving"]);
 // Reading a clip's shots happens inside the render request. One still
 // "analysing" this long after its last update lost that request — the server
 // says the same, and lets it be rendered again.
@@ -298,7 +295,6 @@ export function SourcePage({ id, navigate }: { id: string; navigate: (to: string
                 <Loader2 className="inline w-4 h-4 mr-1.5 -mt-0.5 animate-spin" />
                 Watching and listening to the whole video. A long video takes a few minutes — you can leave this page
                 and come back.
-                {live.some((c) => !KEPT.has(c.status)) && " Clips below that aren't rendered yet will be replaced."}
               </p>
             )}
             {finding && live.length === 0 ? (
@@ -327,17 +323,16 @@ export function SourcePage({ id, navigate }: { id: string; navigate: (to: string
                     <div className="text-micro uppercase text-muted mb-3">Clips · strongest first</div>
                     <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
                       {live.map((c) => (
-                        <div key={c.id} className={finding && !KEPT.has(c.status) ? "opacity-50" : undefined}>
-                          <ClipCard
-                            clip={c}
-                            thumb={thumb}
-                            busy={submitting}
-                            stale={stale(c)}
-                            onRender={() => renderOne(c)}
-                            onEdit={() => setEditing(c)}
-                            onDrop={() => patch(c, { rejected: true })}
-                          />
-                        </div>
+                        <ClipCard
+                          key={c.id}
+                          clip={c}
+                          thumb={thumb}
+                          busy={submitting}
+                          stale={stale(c)}
+                          onRender={() => renderOne(c)}
+                          onEdit={() => setEditing(c)}
+                          onDrop={() => patch(c, { rejected: true })}
+                        />
                       ))}
                     </div>
                   </section>
@@ -428,13 +423,13 @@ function FindPanel({
   if (!open) {
     return (
       <button className={btnSecondary} onClick={() => setOpen(true)} disabled={busy}>
-        <RotateCcw className="w-4 h-4" /> Find clips again
+        <Sparkles className="w-4 h-4" /> Find more clips
       </button>
     );
   }
   return (
     <section className={`${card} p-5`}>
-      <div className="text-micro uppercase text-muted">Find the clips</div>
+      <div className="text-micro uppercase text-muted">{hasClips ? "Find more clips" : "Find the clips"}</div>
       <p className="mt-1 text-body-sm text-muted max-w-2xl">
         The whole video is watched and listened to at once, so the picks are the strongest in it — not just the first
         good ones, and not only what is said: a sound or a picture can carry a clip. Each clip opens on its hook and
@@ -462,7 +457,9 @@ function FindPanel({
             className="mt-1 block w-20 h-9 px-2.5 rounded-sm bg-surface shadow-edge text-body-sm tabular-nums"
           />
         </label>
-        <span className="pb-2 text-fine text-muted">clips — only the strong ones, so often fewer.</span>
+        <span className="pb-2 text-fine text-muted">
+          {hasClips ? "new clips" : "clips"} — only the strong ones, so often fewer.
+        </span>
         <div className="block">
           <span className="text-label" id="clip-length">Length</span>
           <div role="radiogroup" aria-labelledby="clip-length" className="mt-1 flex h-9 rounded-sm bg-surface-sunken p-0.5">
@@ -488,10 +485,14 @@ function FindPanel({
         {/* The page's one primary action while no clips exist. */}
         <button className={hasClips ? btnSecondary : btnPrimary} onClick={() => onFind(brief, count, length)} disabled={busy}>
           {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
-          {busy ? "Watching the video…" : hasClips ? "Replace unrendered clips" : "Find clips"}
+          {busy ? "Watching the video…" : hasClips ? "Find more clips" : "Find clips"}
         </button>
       </div>
-      {hasClips && <p className="mt-2 text-fine text-muted">Rendered clips (and ones rendering) are kept; the rest are replaced.</p>}
+      {hasClips && (
+        <p className="mt-2 text-fine text-muted">
+          Adds new clips that don't overlap the ones you have. Everything you have stays — drop any you don't want.
+        </p>
+      )}
     </section>
   );
 }

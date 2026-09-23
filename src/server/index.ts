@@ -397,8 +397,9 @@ app.get("/api/sources/:id/playback", async (c) => {
 // One pass over the whole video — watched, listened to, and read with its
 // transcript. Runs on the platform as a job (minutes for a long video), so this
 // answers at once; GET /api/sources/:id picks the result up (advanceRun).
-// Replaces the clips from earlier passes that were never rendered; rendered
-// clips are kept.
+// Additive: it never removes a clip. Every existing clip — rendered, proposed,
+// edited, failed or dropped — stays, and the model is told those stretches
+// are taken, so a second pass finds MORE clips rather than the same ones.
 app.post("/api/sources/:id/find", async (c) => {
   const b = await c.req.json<{ brief?: string; max_clips?: number; clip_length?: string }>().catch(() => ({}) as never);
   const source = await get<Source>("SELECT * FROM sources WHERE id = ?", [c.req.param("id")]);
@@ -414,10 +415,12 @@ app.post("/api/sources/:id/find", async (c) => {
   const clipLength: ClipLength = b.clip_length && b.clip_length in CLIP_LENGTHS ? (b.clip_length as ClipLength) : "standard";
   const brief = (b.brief ?? "").trim().slice(0, 2000);
 
+  const existing = await query<Clip>("SELECT * FROM clips WHERE source_id = ? ORDER BY start_s", [source.id]);
   const ask = findRequest({
     transcript: transcriptForModel(parseVtt(source.transcript)),
     duration: source.duration,
     brief,
+    taken: existing.map((x) => ({ start: x.start_s, end: x.end_s, title: x.title, dropped: x.status === "rejected" })),
     maxClips,
     clipLength,
   });
@@ -467,16 +470,12 @@ async function advanceRun(env: Bindings, source: Source, runRow: Run): Promise<R
   ]);
   if (claim.changes === 1) {
     const cues = parseVtt(source.transcript ?? "");
-    // Rendered clips are kept, and so are ones mid-render: deleting those
-    // would throw away work the person started while this find ran.
-    const kept = await query<Clip>(
-      "SELECT * FROM clips WHERE source_id = ? AND status IN ('rendered', 'rendering', 'saving')",
-      [source.id],
-    );
-    const windows = snapMoments(cues, found.moments, source.duration ?? 0, kept, runRow.clip_length);
-    await run("DELETE FROM clips WHERE source_id = ? AND status NOT IN ('rendered', 'rendering', 'saving')", [source.id]);
-    // Kept clips come first; the new proposals follow, strongest first.
-    const after = kept.reduce((m, r) => Math.max(m, r.rank), 0);
+    // Nothing is removed: a find only adds. New moments must not overlap any
+    // clip there already is — including dropped ones, which the editor said no to.
+    const existing = await query<Clip>("SELECT * FROM clips WHERE source_id = ?", [source.id]);
+    const windows = snapMoments(cues, found.moments, source.duration ?? 0, existing, runRow.clip_length);
+    // Existing clips come first; the new ones follow, strongest first.
+    const after = existing.reduce((m, r) => Math.max(m, r.rank), 0);
     for (const [i, w] of windows.entries()) {
       await run(
         "INSERT INTO clips (source_id, run_id, rank, title, hook, reason, start_s, end_s, layout) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",

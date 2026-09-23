@@ -66,3 +66,27 @@ describe("findRequest", () => {
     expect(r.prompt).toMatch(/15 to 30 seconds/);
   });
 });
+
+describe("findRequest — finding more", () => {
+  it("tells the model which stretches are taken, dropped ones included, and asks for new ones", () => {
+    const r = findRequest({
+      transcript: "[0:00:01.0] hi",
+      duration: 600,
+      brief: "",
+      maxClips: 5,
+      clipLength: "standard",
+      taken: [
+        { start: 186, end: 244, title: "Acid harmonics", dropped: false },
+        { start: 300, end: 330, title: "Weak one", dropped: true },
+      ],
+    });
+    expect(r.prompt).toContain("Find up to 5 new moments");
+    expect(r.prompt).toContain("- 0:03:06.0–0:04:04.0 Acid harmonics");
+    expect(r.prompt).toContain("- 0:05:00.0–0:05:30.0 (dropped) Weak one");
+  });
+  it("says nothing about taken stretches on a first find", () => {
+    const r = findRequest({ transcript: "", duration: 600, brief: "", maxClips: 5, clipLength: "standard" });
+    expect(r.prompt).not.toContain("ALREADY TAKEN");
+    expect(r.prompt).toContain("Find up to 5 moments");
+  });
+});
