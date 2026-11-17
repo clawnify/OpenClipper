@@ -22,10 +22,15 @@ function useRouter() {
   return { path, navigate };
 }
 
-/** Inside the Clawnify dashboard, videos are listed in the dashboard sidebar. */
+/**
+ * Inside the Clawnify dashboard, videos are listed in the dashboard sidebar.
+ * Anywhere else the header stays the navigation and this draws only the
+ * notice card, in the corner.
+ */
 function HostNav({ active, path, navigate }: { active: string; path: string; navigate: (to: string) => void }) {
   const [sources, setSources] = useState<Source[]>([]);
   useEffect(() => {
+    if (!embedded) return;
     api.get<Source[]>("/api/sources").then(setSources).catch(() => {});
     reportLocation(window.location.pathname + window.location.search);
   }, [path]);
@@ -42,6 +47,7 @@ function HostNav({ active, path, navigate }: { active: string; path: string; nav
         },
       ]}
       onNavigate={(item) => item.href && navigate(item.href)}
+      standalone={(nav) => nav.card && <div className="fixed bottom-4 left-4 z-40 w-64">{nav.card}</div>}
     />
   );
 }
@@ -53,7 +59,6 @@ export function App() {
 
   return (
     <div className="h-dvh flex flex-col text-foreground">
-      {embedded && <HostNav active={id} path={path} navigate={navigate} />}
       {!embedded && (
         <header className="flex items-center gap-2 px-5 h-14 border-b border-border bg-surface shrink-0">
           {sourceId && (
@@ -69,6 +74,7 @@ export function App() {
         </header>
       )}
       {sourceId ? <SourcePage id={sourceId} navigate={navigate} /> : <SourcesHome navigate={navigate} />}
+      <HostNav active={id} path={path} navigate={navigate} />
     </div>
   );
 }
